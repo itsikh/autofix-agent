@@ -42,22 +42,31 @@ alert() {
 notify_user() {
     local title="$1"
     local body="$2"
-    # Write alert summary to a temp file and open it — works from any macOS context.
-    # afplay plays the Basso sound to get attention even if the window is behind others.
-    local alert_file="/tmp/autofix-watchdog-alert.txt"
+    local ts
+    ts=$(date '+%Y-%m-%d %H:%M:%S')
+
+    # 1. Play attention sound
+    afplay /System/Library/Sounds/Basso.aiff 2>/dev/null || true
+
+    # 2. Speak the alert (works from any shell context, no GUI needed)
+    say "Autofix watchdog alert. ${title}. ${body}" 2>/dev/null || true
+
+    # 3. Write alert file to Desktop — visible next time user looks at Finder
+    local desktop_file="$HOME/Desktop/WATCHDOG_ALERT_$(date +%Y%m%d_%H%M%S).txt"
     {
         echo "========================================"
         echo " AUTOFIX WATCHDOG ALERT"
-        echo " $(date '+%Y-%m-%d %H:%M:%S')"
+        echo " $ts"
         echo "========================================"
         echo ""
         echo "$title"
         echo ""
         echo "$body"
         echo ""
-    } > "$alert_file"
-    afplay /System/Library/Sounds/Basso.aiff 2>/dev/null || true
-    open "$alert_file" 2>/dev/null || true
+        echo "Full details: $ALERTS_LOG"
+        echo "========================================"
+    } > "$desktop_file"
+    log "Alert file written to Desktop: $desktop_file"
 }
 
 log "=== Watchdog check ==="
