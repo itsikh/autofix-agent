@@ -42,6 +42,12 @@ alert() {
 notify_user() {
     local title="$1"
     local body="$2"
+    # terminal-notifier is a signed app bundle — always works from cron/daemons
+    if command -v terminal-notifier &>/dev/null; then
+        terminal-notifier -title "$title" -message "$body" -sound Basso 2>/dev/null || true
+        return
+    fi
+    # Fallback: osascript via launchctl (works from cron if notification permission granted)
     local uid
     uid=$(id -u)
     launchctl asuser "$uid" osascript \
