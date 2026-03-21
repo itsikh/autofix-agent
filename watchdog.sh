@@ -42,11 +42,22 @@ alert() {
 notify_user() {
     local title="$1"
     local body="$2"
-    # Tell Finder to show the dialog — Finder always runs in the GUI session
-    # and always comes to the front, so the user cannot miss it.
-    osascript \
-        -e "tell application \"Finder\" to display dialog \"${title}: ${body}\" buttons {\"OK\"} giving up after 120" \
-        2>/dev/null || true
+    # Write alert summary to a temp file and open it — works from any macOS context.
+    # afplay plays the Basso sound to get attention even if the window is behind others.
+    local alert_file="/tmp/autofix-watchdog-alert.txt"
+    {
+        echo "========================================"
+        echo " AUTOFIX WATCHDOG ALERT"
+        echo " $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "========================================"
+        echo ""
+        echo "$title"
+        echo ""
+        echo "$body"
+        echo ""
+    } > "$alert_file"
+    afplay /System/Library/Sounds/Basso.aiff 2>/dev/null || true
+    open "$alert_file" 2>/dev/null || true
 }
 
 log "=== Watchdog check ==="
