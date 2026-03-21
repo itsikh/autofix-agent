@@ -59,6 +59,7 @@ LEGACY_PATTERNS=(
     "MyLock/.claude/skills/autofix/autofix-wrapper.sh"
     "SOSBlocker/.claude/skills/autofix/autofix-wrapper.sh"
     "triviaapp/scripts/claude-autofix-wrapper.sh"
+    ".claude/watchdog/autofix-watchdog.sh"
 )
 
 echo "Current crontab:"
