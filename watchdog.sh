@@ -72,16 +72,19 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
     pname="${APP_SLUG_V:-$(basename "$conf" .conf)}"
     pinterval="${CRON_INTERVAL_V:-5}"
 
-    # Prefer per-app log; fallback to agent-level wrapper log
-    plog="$PROJECT_DIR_V/.autofix-logs/cron.log"
-    if [[ -z "$PROJECT_DIR_V" || ! -f "$plog" ]]; then
-        # Check agent-level logs for wrapper run logs
-        agent_log=$(ls -t "$AGENT_DIR/logs/wrapper_run_"*.log 2>/dev/null | head -1 || true)
-        if [[ -z "$agent_log" ]]; then
-            log "$pname: no log file yet — skipping"
-            continue
-        fi
-        plog="$agent_log"
+    # Find the most recently modified log in the per-app log dir (worker writes
+    # autofix_YYYYMMDD.log; legacy scripts wrote cron.log — accept either)
+    plog=""
+    if [[ -n "$PROJECT_DIR_V" && -d "$PROJECT_DIR_V/.autofix-logs" ]]; then
+        plog=$(ls -t "$PROJECT_DIR_V/.autofix-logs/"*.log 2>/dev/null | head -1 || true)
+    fi
+    # Fallback: most recent agent-level wrapper run log
+    if [[ -z "$plog" || ! -f "$plog" ]]; then
+        plog=$(ls -t "$AGENT_DIR/logs/wrapper_run_"*.log 2>/dev/null | head -1 || true)
+    fi
+    if [[ -z "$plog" || ! -f "$plog" ]]; then
+        log "$pname: no log file yet — skipping"
+        continue
     fi
 
     # 2a. Log freshness
@@ -179,18 +182,13 @@ while IFS= read -r l; do
     all_locks+=("$l")
 done < <(ls -d /tmp/*autofix*.lockdir /tmp/*autofix*.lock 2>/dev/null || true)
 
-# Deduplicate
-declare -a unique_locks=()
-declare -A seen_locks=()
-for l in "${all_locks[@]}"; do
-    [[ -z "$l" ]] && continue
-    if [[ -z "${seen_locks[$l]+x}" ]]; then
-        seen_locks[$l]=1
-        unique_locks+=("$l")
-    fi
-done
+# Deduplicate via sort (bash 3.2 compatible — no associative arrays)
+_lock_tmp=$(mktemp)
+for l in "${all_locks[@]}"; do [[ -n "$l" ]] && echo "$l"; done > "$_lock_tmp"
+ls -d /tmp/*autofix*.lockdir /tmp/*autofix*.lock 2>/dev/null >> "$_lock_tmp" || true
 
-for lock in "${unique_locks[@]}"; do
+while IFS= read -r lock; do
+    [[ -z "$lock" ]] && continue
     [[ -d "$lock" ]] || continue
 
     lock_pid=$(cat "$lock/pid" 2>/dev/null | tr -d '[:space:]' || echo "")
@@ -219,7 +217,8 @@ for lock in "${unique_locks[@]}"; do
         log "Lock $lock owner PID $lock_pid is dead — removing."
         rm -rf "$lock"
     fi
-done
+done < <(sort -u "$_lock_tmp")
+rm -f "$_lock_tmp"
 
 # ── Step 6: Kill orphaned stuck sub-processes ─────────────────────────────────
 while IFS= read -r line; do

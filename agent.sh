@@ -57,6 +57,8 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
         continue
     fi
 
+    PROJECT_DIR_V=$(grep -E '^PROJECT_DIR=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
+
     # Quick check: any open autofix issues?
     count=$(gh issue list \
         --repo "$BUGS_REPO_V" \
@@ -73,6 +75,12 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
         pending_confs+=("$conf")
     else
         log "${APP_SLUG_V}: no open issues — skipping"
+        # Write heartbeat so watchdog knows this app is being checked regularly
+        if [[ -n "$PROJECT_DIR_V" ]]; then
+            mkdir -p "$PROJECT_DIR_V/.autofix-logs"
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$APP_SLUG_V] No open issues — skipping." \
+                >> "$PROJECT_DIR_V/.autofix-logs/autofix_$(date +%Y%m%d).log"
+        fi
     fi
 done
 
