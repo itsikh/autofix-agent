@@ -42,10 +42,10 @@ alert() {
 notify_user() {
     local title="$1"
     local body="$2"
-    # display alert is a modal dialog — no notification permission needed, always visible,
-    # auto-dismisses after 60 seconds so cron is never blocked indefinitely.
+    # Tell Finder to show the dialog — Finder always runs in the GUI session
+    # and always comes to the front, so the user cannot miss it.
     osascript \
-        -e "display alert \"$title\" message \"$body\" buttons {\"OK\"} giving up after 60" \
+        -e "tell application \"Finder\" to display dialog \"${title}: ${body}\" buttons {\"OK\"} giving up after 120" \
         2>/dev/null || true
 }
 
@@ -177,15 +177,17 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
     [[ -n "$slug" ]] && all_locks+=("/tmp/${slug}-autofix.lockdir")
 done
 
+shopt -u nullglob  # turn off nullglob before find — prevents ls/find getting no args
+
 # Also scan /tmp for any autofix lock dirs not in registry
 while IFS= read -r l; do
     all_locks+=("$l")
-done < <(ls -d /tmp/*autofix*.lockdir /tmp/*autofix*.lock 2>/dev/null || true)
+done < <(find /tmp -maxdepth 1 \( -name "*autofix*.lockdir" -o -name "*autofix*.lock" \) 2>/dev/null || true)
 
 # Deduplicate via sort (bash 3.2 compatible — no associative arrays)
 _lock_tmp=$(mktemp)
 for l in "${all_locks[@]}"; do [[ -n "$l" ]] && echo "$l"; done > "$_lock_tmp"
-ls -d /tmp/*autofix*.lockdir /tmp/*autofix*.lock 2>/dev/null >> "$_lock_tmp" || true
+find /tmp -maxdepth 1 \( -name "*autofix*.lockdir" -o -name "*autofix*.lock" \) 2>/dev/null >> "$_lock_tmp" || true
 
 while IFS= read -r lock; do
     [[ -z "$lock" ]] && continue
