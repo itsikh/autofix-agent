@@ -42,16 +42,10 @@ alert() {
 notify_user() {
     local title="$1"
     local body="$2"
-    # terminal-notifier is a signed app bundle — always works from cron/daemons
-    if command -v terminal-notifier &>/dev/null; then
-        terminal-notifier -title "$title" -message "$body" -sound Basso -timeout 5 2>/dev/null || true
-        return
-    fi
-    # Fallback: osascript via launchctl (works from cron if notification permission granted)
-    local uid
-    uid=$(id -u)
-    launchctl asuser "$uid" osascript \
-        -e "display notification \"$body\" with title \"$title\" sound name \"Basso\"" \
+    # display alert is a modal dialog — no notification permission needed, always visible,
+    # auto-dismisses after 60 seconds so cron is never blocked indefinitely.
+    osascript \
+        -e "display alert \"$title\" message \"$body\" buttons {\"OK\"} giving up after 60" \
         2>/dev/null || true
 }
 
