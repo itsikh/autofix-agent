@@ -111,7 +111,9 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
     # 2b. Consecutive failures in last 40 log lines
     recent=$(tail -40 "$plog" 2>/dev/null || true)
     fail_count=$(echo "$recent" | grep -cE "exhausted|Giving up|ERROR.*meta-retries" || true)
-    ok_count=$(echo   "$recent" | grep -cE "succeeded|No open|no open|no issues|completed|done.*fixed" || true)
+    # Count real worker successes only — exclude heartbeat "No open issues" lines
+    # which only mean there were no issues to process, not that a fix succeeded.
+    ok_count=$(echo "$recent" | grep -cE "succeeded|completed|done.*fixed|issue.*fixed|Closed issue" || true)
 
     if [[ $fail_count -ge 3 && $ok_count -eq 0 ]]; then
         alert "$pname: $fail_count consecutive failures with 0 successes — script or config broken"
