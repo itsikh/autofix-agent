@@ -98,7 +98,7 @@ batch_apps=()
 
 flush_batch() {
     local i=0
-    for pid in "${batch_pids[@]}"; do
+    for pid in "${batch_pids[@]+"${batch_pids[@]}"}"; do
         local app="${batch_apps[$i]:-?}"
         if wait "$pid"; then
             log "$app: worker completed successfully"
