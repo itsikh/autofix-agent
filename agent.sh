@@ -14,22 +14,58 @@ set -uo pipefail
 #   AUTOFIX_MAX_PARALLEL  default 3 (overridden by --max-parallel)
 ###############################################################################
 
-export PATH="/opt/homebrew/bin:/Users/itsik-personal/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
 unset CLAUDECODE  # prevent "nested session" error when run from cron
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MAX_PARALLEL="${AUTOFIX_MAX_PARALLEL:-3}"
 
-# Parse --max-parallel argument
+# On Linux (cloud) default to 1 — one build at a time to stay within e2-micro RAM budget.
+# On macOS default to 3 — Mac has plenty of RAM for parallel builds.
+if [[ "${AUTOFIX_MAX_PARALLEL:-}" != "" ]]; then
+    MAX_PARALLEL="$AUTOFIX_MAX_PARALLEL"
+elif [[ "$(uname)" == "Darwin" ]]; then
+    MAX_PARALLEL=3
+else
+    MAX_PARALLEL=1
+fi
+
+# Timeout wrapper for gh CLI calls (portable macOS, no coreutils needed)
+GH_TIMEOUT="${GH_TIMEOUT:-120}"
+run_with_timeout() {
+    perl -e '
+        my $timeout = shift @ARGV;
+        my $pid = fork // die "fork: $!";
+        if ($pid == 0) { exec @ARGV; die "exec: $!" }
+        $SIG{ALRM} = sub { kill "TERM", $pid; waitpid($pid, 0); exit 124 };
+        alarm $timeout;
+        waitpid($pid, 0);
+        alarm 0;
+        exit ($? >> 8);
+    ' "$GH_TIMEOUT" "$@"
+}
+
+# --list-json: discover apps with open issues, print their slugs as a JSON array
+# and exit without running any workers. Used by CI to build a job matrix so that
+# only apps with actual work get cloned.
+LIST_JSON=false
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --max-parallel) MAX_PARALLEL="$2"; shift 2 ;;
+        --list-json)    LIST_JSON=true; shift ;;
         *) shift ;;
     esac
 done
 
 timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
-log()       { echo "[$(timestamp)] [agent] $*"; }
+# In --list-json mode stdout must carry only the JSON array, so logs go to stderr.
+log() {
+    if [[ "$LIST_JSON" == "true" ]]; then
+        echo "[$(timestamp)] [agent] $*" >&2
+    else
+        echo "[$(timestamp)] [agent] $*"
+    fi
+}
 
 log "=== Agent run started (max-parallel=$MAX_PARALLEL) ==="
 
@@ -44,6 +80,25 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
     APP_SLUG_V=$(grep -E '^APP_SLUG=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
     BUGS_REPO_V=$(grep -E '^BUGS_REPO=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
     CUSTOM_V=$(grep -E '^CUSTOM_SCRIPT=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
+    CLOUD_SKIP_V=$(grep -E '^CLOUD_SKIP=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
+    ENABLED_V=$(grep -E '^ENABLED=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
+
+    # Registered but switched off — stays in apps/ so its config isn't lost.
+    if [[ "$ENABLED_V" == "false" ]]; then
+        log "${APP_SLUG_V:-$(basename "$conf" .conf)}: ENABLED=false — skipping"
+        continue
+    fi
+
+    # --app <slug> / AUTOFIX_ONLY_APP restricts the run to a single app.
+    if [[ -n "${AUTOFIX_ONLY_APP:-}" && "$APP_SLUG_V" != "${AUTOFIX_ONLY_APP}" ]]; then
+        continue
+    fi
+
+    # Skip apps not supported on this host (e.g. Bitbucket-only apps on cloud)
+    if [[ "$(uname)" != "Darwin" && "$CLOUD_SKIP_V" == "true" ]]; then
+        log "${APP_SLUG_V:-$(basename "$conf" .conf)}: CLOUD_SKIP=true — not supported on this host"
+        continue
+    fi
 
     if [[ -n "$CUSTOM_V" ]]; then
         # Custom scripts manage their own issue detection — always queue them
@@ -59,15 +114,25 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
 
     PROJECT_DIR_V=$(grep -E '^PROJECT_DIR=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
 
-    # Quick check: any open autofix issues?
-    count=$(gh issue list \
+    # Quick check: any open autofix issues that nobody is already working on?
+    #
+    # Issues labelled claude-active are excluded. That label is how a run claims
+    # an issue, and because it lives on GitHub it arbitrates across machines —
+    # so the Mac cron and the GitHub Actions run never duplicate each other's
+    # work. worker.sh applies the same filter when it builds its task list.
+    count=$(run_with_timeout gh issue list \
         --repo "$BUGS_REPO_V" \
         --state open \
         --label autofix \
-        --json number \
-        --limit 1 \
+        --json number,labels \
+        --limit 50 \
         2>/dev/null \
-        | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null \
+        | python3 -c "
+import json, sys
+issues = json.load(sys.stdin)
+print(sum(1 for i in issues
+          if 'claude-active' not in [l['name'] for l in i.get('labels', [])]))
+" 2>/dev/null \
         || echo 0)
 
     if [[ "$count" -gt 0 ]]; then
@@ -84,6 +149,20 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
     fi
 done
 
+if [[ "$LIST_JSON" == "true" ]]; then
+    # Emit a JSON array of slugs for a CI job matrix. Nothing but JSON on stdout.
+    slugs=()
+    for conf in "${pending_confs[@]:-}"; do
+        [[ -n "$conf" ]] || continue
+        s=$(grep -E '^APP_SLUG=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
+        slugs+=("${s:-$(basename "$conf" .conf)}")
+    done
+    printf '%s\n' "${slugs[@]:-}" \
+        | grep -v '^$' \
+        | python3 -c "import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))"
+    exit 0
+fi
+
 if [[ ${#pending_confs[@]} -eq 0 ]]; then
     log "No apps with open issues. Exiting."
     exit 0
@@ -98,7 +177,8 @@ batch_apps=()
 
 flush_batch() {
     local i=0
-    for pid in "${batch_pids[@]+"${batch_pids[@]}"}"; do
+    [[ ${#batch_pids[@]} -eq 0 ]] && return
+    for pid in "${batch_pids[@]}"; do
         local app="${batch_apps[$i]:-?}"
         if wait "$pid"; then
             log "$app: worker completed successfully"

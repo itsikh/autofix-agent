@@ -2,10 +2,20 @@
 
 Unified autonomous bug-fixing agent for Android apps. A single codebase replaces all per-app autofix scripts — new apps register by adding a `.conf` file.
 
+Runs in **two places at once** — see [docs/CLOUD.md](docs/CLOUD.md):
+
+| | Where | Interval |
+|---|---|---|
+| Local | your Mac, via `cron` | every 5 min |
+| Cloud | GitHub Actions (free) | hourly |
+
+They share work safely via the `claude-active` GitHub label, which acts as a
+cross-machine lock. If the Mac is asleep, the cloud run picks the work up.
+
 ## How it works
 
 ```
-cron (every 5 min)
+LOCAL — cron (every 5 min)
   └── wrapper.sh         ← meta-wrapper with self-healing
         └── agent.sh     ← dispatcher: checks all apps for open issues
               ├── worker.sh apps/mychef.conf     ┐
@@ -14,6 +24,12 @@ cron (every 5 min)
 
 cron (every 30 min)
   └── watchdog.sh        ← health monitor & macOS notifier
+
+CLOUD — .github/workflows/autofix.yml (hourly)
+  └── scan   ← agent.sh --list-json (no clones, ~1 min when idle)
+        └── fix  ← matrix, one job per app with work
+              ├── ci/clone-app.sh apps/<slug>.conf
+              └── worker.sh apps/<slug>.conf
 ```
 
 1. **`agent.sh`** reads every `apps/*.conf` file, quick-checks GitHub for open `autofix`-labelled issues, then runs `worker.sh` for each app that has open issues — up to `MAX_PARALLEL` (default 3) at once.
@@ -87,9 +103,19 @@ CRON_INTERVAL=20
 autofix-agent/
 ├── agent.sh            ← dispatcher
 ├── worker.sh           ← per-app fix loop
-├── wrapper.sh          ← cron entry point (self-healing)
-├── watchdog.sh         ← health monitor
-├── install.sh          ← one-time setup
+├── wrapper.sh          ← cron entry point (self-healing, Mac)
+├── watchdog.sh         ← health monitor (Mac)
+├── install.sh          ← one-time setup (Mac cron)
+├── .github/workflows/
+│   └── autofix.yml     ← hourly cloud run (GitHub Actions)
+├── ci/
+│   └── clone-app.sh    ← clones one app into the CI workspace
+├── cloud/              ← paid-VM fallback (see docs/CLOUD.md)
+│   └── gradle.properties
+├── setup-cloud.sh      ← provisions a GCE VM (fallback path)
+├── test-cloud-build.sh ← measures real build memory per app
+├── docs/
+│   └── CLOUD.md        ← cloud setup, secrets, sizing data
 ├── apps/               ← per-app config files
 │   ├── mychef.conf
 │   ├── mylock.conf
@@ -133,14 +159,27 @@ Group related issues into a single Claude task by adding the same `story:<name>`
 | `CLAUDE_PROMPT_MODE` | | `arg` | `arg` or `stdin` |
 | `CRON_INTERVAL` | | `5` | Expected minutes between runs (watchdog health check) |
 | `CUSTOM_SCRIPT` | | — | If set, exec this script instead of `worker.sh` |
+| `CODE_REPO` | | — | Clone URL for cloud runs (required for GitHub Actions) |
+| `CODE_REPO_MIRROR` | | — | Optional second push remote, added as `mirror` |
+| `ENABLED` | | `true` | `false` skips the app everywhere — local **and** cloud |
+| `CLOUD_SKIP` | | — | `true` skips the app on non-Mac hosts only |
 
 ## Environment variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `AUTOFIX_MAX_PARALLEL` | `3` | Max concurrent workers in `agent.sh` |
+| `AUTOFIX_ONLY_APP` | — | Restrict the run to a single app slug |
+| `AUTOFIX_WORKSPACE` | — | If set, `PROJECT_DIR` becomes `<workspace>/<slug>` (CI) |
 
 Override: `AUTOFIX_MAX_PARALLEL=5 ./agent.sh`
+
+Useful flags:
+
+```bash
+./agent.sh --list-json     # print apps with unclaimed issues as JSON; run no workers
+./agent.sh --max-parallel 5
+```
 
 ## Logs
 

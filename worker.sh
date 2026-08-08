@@ -16,8 +16,13 @@ set -euo pipefail
 #             BUILD_TASK, MAX_RETRIES, CLAUDE_PROMPT_MODE, CUSTOM_SCRIPT
 ###############################################################################
 
-export PATH="/opt/homebrew/bin:/Users/itsik-personal/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
 unset CLAUDECODE  # prevent "nested session" error when run from cron
+
+# Prevent git SSH/HTTP operations from hanging indefinitely
+export GIT_SSH_COMMAND="ssh -o ConnectTimeout=30 -o ServerAliveInterval=10 -o ServerAliveCountMax=3"
+export GIT_HTTP_LOW_SPEED_LIMIT=1000
+export GIT_HTTP_LOW_SPEED_TIME=30
 
 AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -33,8 +38,23 @@ source "$CONF_FILE"
 
 # Required vars
 : "${APP_SLUG:?CONF: APP_SLUG is required}"
-: "${PROJECT_DIR:?CONF: PROJECT_DIR is required}"
 : "${BUGS_REPO:?CONF: BUGS_REPO is required}"
+
+# PROJECT_DIR resolution, most specific first:
+#   1. AUTOFIX_WORKSPACE  — ephemeral CI runner; repos are cloned to <ws>/<slug>
+#   2. PROJECT_DIR_CLOUD  — long-lived Linux VM with repos under ~/dev
+#   3. PROJECT_DIR        — the developer's Mac
+if [[ -n "${AUTOFIX_WORKSPACE:-}" ]]; then
+    PROJECT_DIR="${AUTOFIX_WORKSPACE}/${APP_SLUG}"
+elif [[ "$(uname)" != "Darwin" && -n "${PROJECT_DIR_CLOUD:-}" ]]; then
+    PROJECT_DIR="$PROJECT_DIR_CLOUD"
+fi
+: "${PROJECT_DIR:?CONF: PROJECT_DIR is required (set PROJECT_DIR_CLOUD for non-Mac hosts)}"
+
+if [[ ! -d "$PROJECT_DIR" ]]; then
+    echo "ERROR: PROJECT_DIR not found: $PROJECT_DIR — repo not cloned on this host?" >&2
+    exit 1
+fi
 
 # Optional vars with defaults
 LOCK_SLUG="${LOCK_SLUG:-$APP_SLUG}"
@@ -58,7 +78,21 @@ fi
 LOCK_DIR="/tmp/${LOCK_SLUG}-autofix.lockdir"
 LOG_DIR="$PROJECT_DIR/.autofix-logs"
 PROMPT_TEMPLATE="$AGENT_DIR/prompts/${PROMPT_FILE}.txt"
-JAVA_HOME_PATH="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+
+# Resolve JAVA_HOME: explicit env wins, then OS-specific defaults
+if [[ -n "${JAVA_HOME:-}" && -d "${JAVA_HOME}" ]]; then
+    JAVA_HOME_PATH="${JAVA_HOME}"
+elif [[ "$(uname)" == "Darwin" ]]; then
+    JAVA_HOME_PATH="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
+else
+    # Linux: follow the java symlink back to the JDK root
+    _java_bin="$(command -v java 2>/dev/null || true)"
+    if [[ -n "$_java_bin" ]]; then
+        JAVA_HOME_PATH="$(readlink -f "$_java_bin" | sed 's|/bin/java$||')"
+    else
+        JAVA_HOME_PATH="$(ls -d /usr/lib/jvm/temurin-17* /usr/lib/jvm/java-17* 2>/dev/null | grep -v jre | sort | tail -1 || echo "/usr/lib/jvm/default-java")"
+    fi
+fi
 ACTIVE_LABEL="claude-active"
 AUTOFIX_LABEL="autofix"
 WORK_TMP=""
@@ -72,6 +106,22 @@ fi
 timestamp() { date "+%Y-%m-%d %H:%M:%S"; }
 log()       { echo "[$(timestamp)] [$APP_SLUG] $*"; }
 log_error() { echo "[$(timestamp)] [$APP_SLUG] ERROR: $*" >&2; }
+
+# Timeout wrapper for commands that may hang (e.g. gh CLI network calls).
+# Uses perl alarm signal — portable on macOS without coreutils.
+GH_TIMEOUT="${GH_TIMEOUT:-120}"
+run_with_timeout() {
+    perl -e '
+        my $timeout = shift @ARGV;
+        my $pid = fork // die "fork: $!";
+        if ($pid == 0) { exec @ARGV; die "exec: $!" }
+        $SIG{ALRM} = sub { kill "TERM", $pid; waitpid($pid, 0); exit 124 };
+        alarm $timeout;
+        waitpid($pid, 0);
+        alarm 0;
+        exit ($? >> 8);
+    ' "$GH_TIMEOUT" "$@"
+}
 
 cleanup() {
     rm -rf "$LOCK_DIR"
@@ -195,9 +245,9 @@ ensure_label_exists() {
         label="${label_spec%%:*}"
         color="${label_spec#*:}"; color="${color%%:*}"
         desc="${label_spec##*:}"
-        if ! gh label list --repo "$BUGS_REPO" --search "$label" --json name \
+        if ! run_with_timeout gh label list --repo "$BUGS_REPO" --search "$label" --json name \
             | python3 -c "import sys,json; sys.exit(0 if any(l['name']=='$label' for l in json.load(sys.stdin)) else 1)" 2>/dev/null; then
-            gh label create "$label" --repo "$BUGS_REPO" --description "$desc" --color "$color" 2>/dev/null || true
+            run_with_timeout gh label create "$label" --repo "$BUGS_REPO" --description "$desc" --color "$color" 2>/dev/null || true
             log "Created label '$label'"
         fi
     done
@@ -206,7 +256,7 @@ ensure_label_exists() {
 label_task_active() {
     local task_file="$1"
     while IFS= read -r num; do
-        gh issue edit "$num" --repo "$BUGS_REPO" --add-label "$ACTIVE_LABEL" 2>/dev/null || true
+        run_with_timeout gh issue edit "$num" --repo "$BUGS_REPO" --add-label "$ACTIVE_LABEL" 2>/dev/null || true
     done < <(run_py "$task_file" 'import json,sys
 with open(sys.argv[1]) as f: issues=json.load(f)
 for i in issues: print(i["number"])')
@@ -215,7 +265,7 @@ for i in issues: print(i["number"])')
 unlabel_task_active() {
     local task_file="$1"
     while IFS= read -r num; do
-        gh issue edit "$num" --repo "$BUGS_REPO" --remove-label "$ACTIVE_LABEL" 2>/dev/null || true
+        run_with_timeout gh issue edit "$num" --repo "$BUGS_REPO" --remove-label "$ACTIVE_LABEL" 2>/dev/null || true
     done < <(run_py "$task_file" 'import json,sys
 with open(sys.argv[1]) as f: issues=json.load(f)
 for i in issues: print(i["number"])')
@@ -224,7 +274,26 @@ for i in issues: print(i["number"])')
 # ── Issue Fetching & Grouping ─────────────────────────────────────────────────
 fetch_and_group_issues() {
     local tmp_issues="$WORK_TMP/issues.json"
-    gh issue list --repo "$BUGS_REPO" --state open --label "$AUTOFIX_LABEL" --json number,title,body,labels --limit 100 > "$tmp_issues"
+    local _gh_attempt _gh_max=3
+    for _gh_attempt in 1 2 3; do
+        # Require BOTH a clean exit AND valid JSON: a mid-stream network timeout
+        # can leave gh exiting 0 with a truncated array in $tmp_issues, which
+        # would otherwise crash the unguarded parser below.
+        if run_with_timeout gh issue list --repo "$BUGS_REPO" --state open --label "$AUTOFIX_LABEL" --json number,title,body,labels --limit 100 > "$tmp_issues" \
+            && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$tmp_issues" 2>/dev/null; then
+            break
+        fi
+        if [[ $_gh_attempt -lt $_gh_max ]]; then
+            # NOTE: this function's stdout is captured into $tasks_file by the
+            # caller, so diagnostic logging MUST go to stderr — otherwise the
+            # log line is prepended to the JSON and crashes the parser.
+            log "GitHub API error or invalid response on issue list (attempt $_gh_attempt/$_gh_max) — retrying in 15s..." >&2
+            sleep 15
+        else
+            log_error "GitHub API unavailable after $_gh_max attempts — aborting."
+            return 1
+        fi
+    done
 
     local count
     count=$(run_py "$tmp_issues" 'import json,sys
@@ -412,7 +481,7 @@ print(", ".join("#"+str(i["number"]) for i in issues))')
 
         elif [[ $fix_result -eq 2 ]]; then
             while IFS= read -r num; do
-                gh issue close "$num" --repo "$BUGS_REPO" \
+                run_with_timeout gh issue close "$num" --repo "$BUGS_REPO" \
                     --comment "Autofix agent verified this issue is already resolved in the current code." \
                     2>/dev/null || true
                 log "Closed already-fixed issue #$num"
@@ -429,7 +498,7 @@ for i in issues: print(i["number"])')
     git checkout -- . 2>/dev/null || true
     git clean -fd 2>/dev/null || true
     while IFS= read -r num; do
-        gh issue comment "$num" --repo "$BUGS_REPO" \
+        run_with_timeout gh issue comment "$num" --repo "$BUGS_REPO" \
             --body "Autofix agent failed to resolve this issue after $MAX_RETRIES attempts. Manual intervention required." \
             2>/dev/null || true
     done < <(run_py "$task_file" 'import json,sys
@@ -513,7 +582,7 @@ print(", ".join("#"+str(i["number"]) for i in issues))')
                 [[ -z "$close_body" ]] && close_body="Fixed by autofix agent."
 
                 while IFS= read -r num; do
-                    gh issue close "$num" --repo "$BUGS_REPO" \
+                    run_with_timeout gh issue close "$num" --repo "$BUGS_REPO" \
                         --comment "$(echo -e "$close_body")" 2>/dev/null || true
                     log "Closed issue #$num"
                     all_fixed_issues+=("$num")
