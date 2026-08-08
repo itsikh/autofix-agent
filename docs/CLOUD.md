@@ -38,19 +38,35 @@ The original plan (`setup-cloud.sh`, `cloud/gradle.properties`) targeted a GCE
 gives as **1 GB RAM, 0.25 vCPU baseline, 30 GB standard disk**, in
 `us-west1`/`us-central1`/`us-east1` only.
 
-It does not fit. `test-cloud-build.sh` measured actual peak resident memory of
-the whole build process tree (clean `assembleDebug`, `-Xmx700m`):
+It does not fit — not even close. `test-cloud-build.sh` measured actual peak
+resident memory of the whole build process tree (clean `assembleDebug`,
+`-Xmx700m`, measured 2026-08-08):
 
-| App | Tree peak | Largest single process |
-|---|---|---|
-| callguard | 4611 MB | 4384 MB |
-| finnencer | 3252 MB | 3081 MB |
-| sosblocker | 3001 MB | 2909 MB |
-| medreminder | 2825 MB | 2661 MB |
+| App | Tree peak | Largest single process | Smallest VM that fits |
+|---|---|---|---|
+| anova | 5563 MB | 5419 MB | 8 GB |
+| buddy | 4763 MB | 4639 MB | 8 GB |
+| callguard | 4611 MB | 4384 MB | 8 GB |
+| mychef | 4555 MB | 4340 MB | 8 GB |
+| calcvault | 3987 MB | 3946 MB | 8 GB |
+| finnencer | 3252 MB | 3081 MB | 4 GB |
+| sosblocker | 2923 MB | 2762 MB | 4 GB |
+| mylock | 2889 MB | 2721 MB | 4 GB |
+| medreminder | 2825 MB | 2661 MB | 4 GB |
+| triviaapp | 2088 MB | 1827 MB | 4 GB |
 
-Even the smallest app needs ~3 GB — roughly **3× an e2-micro**, at any heap
-setting. CPU is worse: builds taking 40–95 s on Apple silicon would take far
-longer on 0.25 vCPU, and sustained hourly load exhausts burst credits.
+Every app needs at least **2 GB**, and the worst needs **5.5 GB** — 2× to 5×
+an e2-micro's total RAM, at any heap setting. CPU is worse: builds taking
+40–95 s on Apple silicon would take far longer on 0.25 vCPU, and sustained
+hourly load exhausts burst credits.
+
+Caveats on the numbers: measured on macOS, where a tree sum double-counts
+shared pages, so the tree column overstates somewhat. The single-process column
+is the reliable floor. Linux JVM RSS is typically lower than macOS.
+
+A 16 GB Actions runner absorbs the worst case (anova, 5.5 GB) with room to
+spare. On the 8 GB runner a private repo would get, anova plus Claude lands
+around 6 GB — it fits, but the margin is thin.
 
 > **An earlier report claimed the free tier was viable. It was wrong.**
 > The old probe used `/usr/bin/time -l`, which only sees direct waited-for
@@ -63,8 +79,14 @@ longer on 0.25 vCPU, and sustained hourly load exhausts burst credits.
 persistent Gradle cache (every build cold), a ~3 GB Android SDK image to pull,
 and this is a long-lived agent loop rather than a request handler.
 
-`setup-cloud.sh` and `cloud/gradle.properties` are kept as a **paid-VM fallback**
-— on an `e2-medium` (4 GB, ~$13/mo) they work as written.
+`setup-cloud.sh` and `cloud/gradle.properties` are kept as a **paid-VM fallback**,
+but price it honestly before reaching for it: five of the ten apps exceed 4 GB,
+so an `e2-medium` (~$13/mo) is **not** enough. A VM that runs every app needs
+~8 GB — `e2-standard-2`, roughly $50/mo. `cloud/gradle.properties` would also
+need its 700 MB heap raised to match.
+
+That is the comparison that makes GitHub Actions the right call: the same
+workload runs free on a 16 GB runner.
 
 ---
 
