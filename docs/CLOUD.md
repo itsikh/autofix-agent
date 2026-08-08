@@ -227,10 +227,16 @@ with `APP_REPO_TOKEN` and needs no SSH key.
 | sosblocker | Bitbucket (SSH) | — |
 | ~~triviaapp~~ | **disabled** | — |
 
-**triviaapp is disabled.** Its `BUGS_REPO="itsikh/triviaapp"` does not exist on
-GitHub, so every issue lookup failed silently — on the Mac as well as in CI. Its
-code is on Bitbucket but nothing hosts its issues. To re-enable: create a GitHub
-repo for its issues, set `BUGS_REPO` and `CODE_REPO`, and remove `ENABLED="false"`.
+**triviaapp is disabled**, and needs three separate fixes before it could work:
+
+1. `BUGS_REPO="itsikh/triviaapp"` does not exist on GitHub, so every issue
+   lookup failed silently — on the Mac as well as in CI.
+2. Its default branch is **`main-clean`**, but `worker.sh` refuses to run on any
+   branch except `main` (`worker.sh:210`) and pushes `main` explicitly.
+3. It has no `CODE_REPO`, so it is not eligible for CI.
+
+It also carries 3 unpushed local commits touching `scripts/claude-autofix*.sh`,
+the deprecated Gen1 scripts this repo replaced. They were left alone.
 
 ---
 
