@@ -78,6 +78,12 @@ jobs:
           AUTOFIX_ONLY_APP: ${{ inputs.app }}
         run: |
           set -o pipefail
+          # Without a token every `gh issue list` fails, agent.sh's `|| echo 0`
+          # swallows it, and the run reports "nothing to do" forever. Fail loudly.
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::APP_REPO_TOKEN is not set — see docs/CLOUD.md#secrets"
+            exit 1
+          fi
           apps=$(bash agent.sh --list-json)
           count=$(printf '%s' "$apps" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
           echo "apps=$apps"   >> "$GITHUB_OUTPUT"
@@ -185,6 +191,10 @@ jobs:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
+          if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::Set CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY — see docs/CLOUD.md#secrets"
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/logs"
           # Full output goes to a file, not the console — see the security note
           # at the top of this workflow. The step still fails on a non-zero exit;
