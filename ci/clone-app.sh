@@ -52,4 +52,38 @@ if [[ -n "${CODE_REPO_MIRROR:-}" ]]; then
     fi
 fi
 
+# ── Neutralise Mac-only toolchain pins ───────────────────────────────────────
+# Most projects commit a Mac Android Studio path in gradle.properties, and some
+# commit a local.properties with a Mac sdk.dir. Both break on a Linux runner.
+#
+# These files are TRACKED, and worker.sh stages with `git add -u` / `git add -A`,
+# so a plain edit would be committed and pushed back — replacing the Mac paths
+# with Linux ones and breaking local runs. skip-worktree makes git ignore our
+# edit entirely, so the fix stays confined to this runner.
+neutralise() {
+    local file="$1"
+    git -C "$DEST" ls-files --error-unmatch "$file" >/dev/null 2>&1 || return 0
+    git -C "$DEST" update-index --skip-worktree "$file" 2>/dev/null || true
+}
+
+GP="$DEST/gradle.properties"
+if [[ -f "$GP" ]] && grep -qE '^org\.gradle\.java\.home=' "$GP"; then
+    log "commenting out Mac org.gradle.java.home"
+    sed -i.bak -E 's|^(org\.gradle\.java\.home=.*)$|# CI-disabled: \1|' "$GP"
+    rm -f "$GP.bak"
+    neutralise gradle.properties
+fi
+
+# sdk.dir in local.properties overrides ANDROID_HOME, so a stale Mac path wins
+# over the runner's SDK. Point it at the runner's SDK instead.
+LP="$DEST/local.properties"
+if [[ -f "$LP" ]] && [[ -n "${ANDROID_HOME:-}" ]]; then
+    if grep -qE '^sdk\.dir=' "$LP" && ! grep -qxF "sdk.dir=${ANDROID_HOME}" "$LP"; then
+        log "repointing sdk.dir at $ANDROID_HOME"
+        sed -i.bak -E "s|^sdk\.dir=.*$|sdk.dir=${ANDROID_HOME}|" "$LP"
+        rm -f "$LP.bak"
+        neutralise local.properties
+    fi
+fi
+
 log "ready at $DEST"

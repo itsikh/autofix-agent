@@ -100,6 +100,18 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
         continue
     fi
 
+    # --list-json feeds a CI matrix, and CI starts from an empty runner. An app
+    # with no CODE_REPO cannot be cloned there, so it is Mac-only by definition —
+    # skip it rather than queue a job that is guaranteed to fail. Checked before
+    # the CUSTOM_SCRIPT branch below, which queues unconditionally.
+    if [[ "$LIST_JSON" == "true" ]]; then
+        CODE_REPO_V=$(grep -E '^CODE_REPO=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
+        if [[ -z "$CODE_REPO_V" ]]; then
+            log "${APP_SLUG_V:-$(basename "$conf" .conf)}: no CODE_REPO — local-only, not eligible for CI"
+            continue
+        fi
+    fi
+
     if [[ -n "$CUSTOM_V" ]]; then
         # Custom scripts manage their own issue detection — always queue them
         log "${APP_SLUG_V:-$(basename "$conf" .conf)}: custom script — queued"

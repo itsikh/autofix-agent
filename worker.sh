@@ -208,7 +208,7 @@ verify_git_state() {
     fi
     if ! git diff --quiet || ! git diff --cached --quiet; then
         log "Working tree has uncommitted changes. Auto-committing..."
-        git add -u
+        git add -u -- . ':(exclude).autofix-logs'
         git commit -m "autofix: auto-commit pending changes before run" || true
     fi
     while IFS= read -r remote; do
@@ -465,7 +465,10 @@ try_fix_task() {
             local diff_summary diff_detail
             diff_summary=$(git diff --stat 2>/dev/null || echo "")
             diff_detail=$(git diff --no-color 2>/dev/null | head -200 || echo "")
-            git add -A
+            # Exclude the agent's own log dir: not every app repo gitignores
+            # .autofix-logs, and `git add -A` would otherwise commit our logs
+            # into the app's history and push them.
+            git add -A -- . ':(exclude).autofix-logs'
             local issue_numbers
             issue_numbers=$(run_py "$task_file" 'import json,sys
 with open(sys.argv[1]) as f: issues=json.load(f)

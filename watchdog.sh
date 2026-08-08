@@ -89,8 +89,16 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
     APP_SLUG_V=$(grep -E '^APP_SLUG=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
     PROJECT_DIR_V=$(grep -E '^PROJECT_DIR=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
     CRON_INTERVAL_V=$(grep -E '^CRON_INTERVAL=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
+    ENABLED_V=$(grep -E '^ENABLED=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
     pname="${APP_SLUG_V:-$(basename "$conf" .conf)}"
     pinterval="${CRON_INTERVAL_V:-5}"
+
+    # A disabled app stops receiving heartbeats, so its last log goes stale and
+    # the freshness check below would alert "cron may be dead" every 30 minutes.
+    if [[ "$ENABLED_V" == "false" ]]; then
+        log "$pname: ENABLED=false — skipping health check"
+        continue
+    fi
 
     # Find the most recently modified log in the per-app log dir (worker writes
     # autofix_YYYYMMDD.log; legacy scripts wrote cron.log — accept either)

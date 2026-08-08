@@ -234,6 +234,38 @@ repo for its issues, set `BUGS_REPO` and `CODE_REPO`, and remove `ENABLED="false
 
 ---
 
+## Mac-only files neutralised on the runner
+
+Most app repos commit toolchain paths that only exist on the Mac. `ci/clone-app.sh`
+rewrites them after cloning:
+
+| File | Problem | Fix on runner |
+|---|---|---|
+| `gradle.properties` | `org.gradle.java.home=/Applications/Android Studio.app/...` — 7 of 9 apps | line commented out; `~/.gradle` pins the runner JDK |
+| `local.properties` | `sdk.dir` pointing at a Mac path — sosblocker | repointed at `$ANDROID_HOME` |
+
+Both files are **tracked**, and `worker.sh` stages with `git add -u` / `git add -A`.
+A plain edit would therefore be committed and pushed, replacing the Mac paths
+with Linux ones and breaking local runs. So each edited file is marked
+`git update-index --skip-worktree`, which makes git ignore the change entirely —
+`git status` stays clean and `git add -A` stages nothing.
+
+> Unrelated but worth fixing at source: sosblocker's committed `local.properties`
+> reads `sdk.dir=/Users/itsik-personal/dev/triviaapp`, which is a project
+> directory, not an SDK. CI overrides it, but the Mac is relying on a fallback.
+
+## Assumptions this design makes
+
+- **Every app's default branch is `main`.** `worker.sh` rebases onto
+  `origin/main`, pushes `main`, and refuses to run on any other branch;
+  `ci/clone-app.sh` resets to `origin/main`. Verified true for all 9 enabled
+  apps. A `master`-based app would need changes in `worker.sh` first.
+- **An app without `CODE_REPO` is Mac-only.** `agent.sh --list-json` skips it, so
+  it never reaches CI. Local runs are unaffected.
+- **`.autofix-logs` is never committed.** `worker.sh` excludes it via pathspec
+  rather than relying on each app's `.gitignore` — buddy's repo does not ignore
+  it, and would otherwise have had agent logs pushed into its history.
+
 ## Operating notes
 
 - **Scheduled runs drift.** GitHub delays `schedule:` triggers under load, often
