@@ -170,7 +170,10 @@ jobs:
           # surfaces later as a silent mirror-push failure. Non-fatal: apps
           # hosted entirely on GitHub do not need Bitbucket at all.
           auth_out=$(ssh -o BatchMode=yes -T git@bitbucket.org 2>&1 || true)
-          if printf '%s' "$auth_out" | grep -q "logged in as"; then
+          # Bitbucket answers "authenticated via ssh key."; older/other accounts
+          # get "logged in as <user>". Accept either — matching only one of them
+          # reports a working key as broken.
+          if printf '%s' "$auth_out" | grep -qE "authenticated via ssh key|logged in as"; then
             echo "Bitbucket SSH auth: OK"
           else
             echo "::warning::Bitbucket SSH auth FAILED — mirror pushes and Bitbucket-only clones will not work"

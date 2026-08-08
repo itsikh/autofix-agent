@@ -159,7 +159,10 @@ echo " Press ENTER after you've added the key to Bitbucket..."
 read -r
 
 # Verify SSH works before cloning
-if ssh -T git@bitbucket.org 2>&1 | grep -q "logged in as"; then
+# Bitbucket answers "authenticated via ssh key."; some accounts get
+# "logged in as <user>". Matching only the latter reports a working key as
+# broken and skips the clones below.
+if ssh -T git@bitbucket.org 2>&1 | grep -qE "authenticated via ssh key|logged in as"; then
     log "Bitbucket SSH auth: OK"
     clone_if_missing "git@bitbucket.org:itsik_harel/mychef.git"     "mychef"
     clone_if_missing "git@bitbucket.org:itsik_harel/sosblocker.git" "SOSBlocker"
