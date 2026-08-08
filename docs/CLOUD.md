@@ -242,7 +242,7 @@ rewrites them after cloning:
 | File | Problem | Fix on runner |
 |---|---|---|
 | `gradle.properties` | `org.gradle.java.home=/Applications/Android Studio.app/...` — 7 of 9 apps | line commented out; `~/.gradle` pins the runner JDK |
-| `local.properties` | `sdk.dir` pointing at a Mac path — sosblocker | repointed at `$ANDROID_HOME` |
+| `local.properties` | a tracked `sdk.dir` overrides `ANDROID_HOME` | repointed at `$ANDROID_HOME` |
 
 Both files are **tracked**, and `worker.sh` stages with `git add -u` / `git add -A`.
 A plain edit would therefore be committed and pushed, replacing the Mac paths
@@ -250,9 +250,12 @@ with Linux ones and breaking local runs. So each edited file is marked
 `git update-index --skip-worktree`, which makes git ignore the change entirely —
 `git status` stays clean and `git add -A` stages nothing.
 
-> Unrelated but worth fixing at source: sosblocker's committed `local.properties`
-> reads `sdk.dir=/Users/itsik-personal/dev/triviaapp`, which is a project
-> directory, not an SDK. CI overrides it, but the Mac is relying on a fallback.
+No app currently tracks a `local.properties` — sosblocker did, pinning
+`sdk.dir` to a project directory rather than an SDK, and was
+[fixed at source](https://bitbucket.org/itsik_harel/sosblocker) by untracking
+the file (its `.gitignore` had listed it all along, but `.gitignore` does not
+affect already-tracked files). The `local.properties` handling above is kept as
+a safety net for any app that reintroduces one.
 
 ## Assumptions this design makes
 
