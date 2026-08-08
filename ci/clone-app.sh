@@ -86,4 +86,30 @@ if [[ -f "$LP" ]] && [[ -n "${ANDROID_HOME:-}" ]]; then
     fi
 fi
 
+# ── Placeholder keystore.properties ─────────────────────────────────────────
+# Most apps read keystore.properties in app/build.gradle.kts but gitignore the
+# file, so a fresh clone has no copy. Gradle then dies during CONFIGURATION
+# ("null cannot be cast to non-null type kotlin.String"), which fails every
+# task including assembleDebug.
+#
+# That failure is dangerous, not merely annoying: the agent sees a broken build,
+# treats it as the bug, and "fixes" it by rewriting the release signing config —
+# committing an unrequested change that makes release builds silently unsigned.
+# A placeholder keeps configuration valid so the agent never sees the problem.
+#
+# Only written when absent, so an app that legitimately tracks the file (buddy)
+# keeps its real one. Never committed: these repos already gitignore it.
+KS="$DEST/keystore.properties"
+if [[ ! -f "$KS" ]] && grep -rqs "keystore.properties" "$DEST/app/build.gradle.kts" "$DEST/build.gradle.kts" 2>/dev/null; then
+    log "writing placeholder keystore.properties (release signing unused by CI)"
+    cat > "$KS" <<'KSEOF'
+# Placeholder written by ci/clone-app.sh so Gradle configuration succeeds.
+# CI only builds debug variants; these values never sign a real artifact.
+storeFile=ci-placeholder.jks
+storePassword=ci-placeholder
+keyAlias=ci-placeholder
+keyPassword=ci-placeholder
+KSEOF
+fi
+
 log "ready at $DEST"
