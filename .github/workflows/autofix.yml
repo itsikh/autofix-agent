@@ -166,6 +166,14 @@ jobs:
           chmod 600 ~/.ssh/id_ed25519
           ssh-keyscan -t rsa,ed25519 bitbucket.org >> ~/.ssh/known_hosts 2>/dev/null
           chmod 600 ~/.ssh/known_hosts
+          # Prove the key actually authenticates. Without this, a bad key only
+          # surfaces later as a silent mirror-push failure. Non-fatal: apps
+          # hosted entirely on GitHub do not need Bitbucket at all.
+          if ssh -T git@bitbucket.org 2>&1 | grep -q "logged in as"; then
+            echo "Bitbucket SSH auth: OK"
+          else
+            echo "::warning::Bitbucket SSH auth FAILED — mirror pushes and Bitbucket-only clones will not work"
+          fi
 
       - name: Apply cloud Gradle settings
         run: |
