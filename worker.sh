@@ -194,8 +194,9 @@ push_to_remote() {
         return 0
     fi
     log "Fast-forward push to $remote rejected — retrying with --force-with-lease..."
-    git push "$remote" main --force-with-lease 2>/dev/null || \
-        log_error "Could not push to $remote"
+    local err
+    err=$(git push "$remote" main --force-with-lease 2>&1) || \
+        log_error "Could not push to $remote: $err"
 }
 
 verify_git_state() {
@@ -602,11 +603,26 @@ for i in issues: print(i["number"])')
         done
 
         if [[ ${#fixed_this_round[@]} -gt 0 ]]; then
+            # Never swallow the push error. A failed push here means the issue
+            # was closed but the fix never left the machine — the worst possible
+            # outcome, and it used to be reported as "Pushed fixes".
+            local push_failed=false
             while IFS= read -r remote; do
                 [[ -z "$remote" ]] && continue
-                git push "$remote" main 2>/dev/null || true
+                local push_err
+                if ! push_err=$(git push "$remote" main 2>&1); then
+                    log_error "Push to '$remote' FAILED: $push_err"
+                    push_failed=true
+                else
+                    log "Pushed to '$remote'."
+                fi
             done < <(get_remotes)
-            log "Pushed fixes for round $round."
+            if [[ "$push_failed" == "true" ]]; then
+                log_error "Round $round: fixes committed but NOT pushed."
+                any_failed=true
+            else
+                log "Pushed fixes for round $round."
+            fi
         else
             log "No issues fixed this round. Stopping."
             break

@@ -186,6 +186,9 @@ jobs:
       - name: Clone app repo
         env:
           APP: ${{ matrix.app }}
+          # Private app repos (mylock, calc-vault, CallAuditer, mychef-releases)
+          # clone over HTTPS and need the credential helper to find this token.
+          APP_REPO_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
         run: bash ci/clone-app.sh "apps/${APP}.conf"
 
       - name: Run autofix
@@ -225,7 +228,9 @@ jobs:
           else
             echo "── status lines only (full output withheld: public repo) ──"
             # Dispatcher/worker status lines carry no file contents or diffs.
-            grep -E '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}\] \[[a-z0-9-]+\] (===|Task |Issue |Build |Pushed|Closed|No |Acquired|Released|Skipping)' \
+            # ERROR: is included deliberately — a hidden failure is far worse
+            # than the small amount of context an error message reveals.
+            grep -E '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}\] \[[a-z0-9-]+\] (ERROR|===|Task |Issue |Build |Pushed|Pushed to|Closed|No |Acquired|Released|Skipping)' \
               "$LOG" || echo "(no status lines matched)"
             echo "── $(wc -l < "$LOG") total lines withheld ──"
           fi
