@@ -169,10 +169,13 @@ jobs:
           # Prove the key actually authenticates. Without this, a bad key only
           # surfaces later as a silent mirror-push failure. Non-fatal: apps
           # hosted entirely on GitHub do not need Bitbucket at all.
-          if ssh -T git@bitbucket.org 2>&1 | grep -q "logged in as"; then
+          auth_out=$(ssh -o BatchMode=yes -T git@bitbucket.org 2>&1 || true)
+          if printf '%s' "$auth_out" | grep -q "logged in as"; then
             echo "Bitbucket SSH auth: OK"
           else
             echo "::warning::Bitbucket SSH auth FAILED — mirror pushes and Bitbucket-only clones will not work"
+            echo "ssh said: $auth_out"
+            echo "key fingerprint: $(ssh-keygen -lf ~/.ssh/id_ed25519 2>&1 || echo unreadable)"
           fi
 
       - name: Apply cloud Gradle settings
