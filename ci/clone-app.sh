@@ -50,6 +50,23 @@ if [[ -n "${CODE_REPO_MIRROR:-}" ]]; then
         log "adding mirror remote"
         git -C "$DEST" remote add mirror "$CODE_REPO_MIRROR"
     fi
+
+    # Refuse to work on stale code. CODE_REPO and CODE_REPO_MIRROR are two views
+    # of the same project, and worker.sh pushes to both — falling back to
+    # --force-with-lease. If the mirror holds commits the clone lacks, fixing
+    # here and pushing could overwrite them. buddy hit exactly this: its GitHub
+    # mirror sat one release commit behind Bitbucket for months.
+    if git -C "$DEST" fetch -q mirror main 2>/dev/null; then
+        ahead=$(git -C "$DEST" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
+        if [[ "${ahead:-0}" -gt 0 ]]; then
+            echo "[clone] [$APP_SLUG] ERROR: mirror is ${ahead} commit(s) ahead of CODE_REPO." >&2
+            echo "[clone] [$APP_SLUG] Fixing here would build on stale code. Sync the two remotes first." >&2
+            exit 1
+        fi
+        log "mirror is in sync"
+    else
+        log "WARNING: could not fetch mirror — skipping the staleness check"
+    fi
 fi
 
 # ── Neutralise Mac-only toolchain pins ───────────────────────────────────────

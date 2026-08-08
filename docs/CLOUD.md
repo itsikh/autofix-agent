@@ -257,6 +257,19 @@ the file (its `.gitignore` had listed it all along, but `.gitignore` does not
 affect already-tracked files). The `local.properties` handling above is kept as
 a safety net for any app that reintroduces one.
 
+## Guards that keep CI from damaging app repos
+
+CI differs from the Mac in ways the agent will otherwise "fix" by editing your
+code. Each guard below exists because that actually happened.
+
+| Guard | Why |
+|---|---|
+| Placeholder `keystore.properties` | 6 of 9 apps read it but gitignore it. Without it Gradle dies during *configuration*, the agent treats the broken build as the bug, and rewrites the release signing config — making release builds silently unsigned. Only written when absent, so buddy keeps its tracked copy. |
+| Mirror staleness check | `worker.sh` pushes to every remote and falls back to `--force-with-lease`. If the mirror holds commits the clone lacks, a fix built here could overwrite them. buddy's GitHub mirror sat one release commit behind Bitbucket for months. Clone aborts rather than risk it. |
+| Bitbucket SSH verification | The key was written but never tested, so a bad key surfaced only as a silently failed mirror push. |
+| `AUTOFIX_RELEASE_MODE=none` | No signing keystore here, so `/release` would bump a version it can never publish. The Mac cuts releases. |
+| Build always verified in CI | `worker.sh` skips its build when Claude self-commits, on the assumption `/release` rebuilds. With releases off, that would push an unverified fix, so the build runs explicitly. |
+
 ## Assumptions this design makes
 
 - **Every app's default branch is `main`.** `worker.sh` rebases onto

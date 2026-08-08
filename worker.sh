@@ -424,9 +424,16 @@ attempt_fix() {
         return 1
     fi
 
-    if [[ "$claude_committed" == "true" ]]; then
+    # Skipping the build here is only safe because /release rebuilds everything.
+    # With RELEASE_MODE=none (CI has no signing keystore) nothing would rebuild,
+    # so a self-committed fix would be pushed entirely unverified. Fall through
+    # to the explicit build in that case.
+    if [[ "$claude_committed" == "true" && "$RELEASE_MODE" != "none" ]]; then
         log "Claude committed changes (HEAD moved to ${head_after:0:8}) — build verified by release."
         return 0
+    fi
+    if [[ "$claude_committed" == "true" ]]; then
+        log "Claude committed changes (HEAD moved to ${head_after:0:8}) — verifying build (no release will run)."
     fi
 
     log "Verifying build ($BUILD_TASK)..."
