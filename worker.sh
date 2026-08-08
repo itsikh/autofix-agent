@@ -61,6 +61,10 @@ LOCK_SLUG="${LOCK_SLUG:-$APP_SLUG}"
 GIT_REMOTES="${GIT_REMOTES:-auto}"
 PROMPT_FILE="${PROMPT_FILE:-android-default}"
 RELEASE_MODE="${RELEASE_MODE:-skill}"
+# Host-level override. CI has no signing keystore, so /release there bumps the
+# version but cannot publish — leaving a version with no matching release.
+# Releases belong on the Mac, where the real keystore lives.
+[[ -n "${AUTOFIX_RELEASE_MODE:-}" ]] && RELEASE_MODE="$AUTOFIX_RELEASE_MODE"
 BUILD_TASK="${BUILD_TASK:-assembleDebug}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 CLAUDE_PROMPT_MODE="${CLAUDE_PROMPT_MODE:-arg}"

@@ -107,6 +107,9 @@ jobs:
       AUTOFIX_WORKSPACE: ${{ github.workspace }}/_apps
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      # No signing keystore here, so /release could bump a version without ever
+      # publishing it. Fixes are pushed; the Mac cuts the release.
+      AUTOFIX_RELEASE_MODE: none
     steps:
       - uses: actions/checkout@v4
         with:
