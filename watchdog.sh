@@ -68,6 +68,19 @@ notify_user() {
         echo "========================================"
     } > "$desktop_file"
     log "Alert file written to Desktop: $desktop_file"
+
+    # 4. Email — the only channel that reaches the user when they are not at
+    #    this Mac. Sends the whole alert list, not the one-line summary the
+    #    sound and Desktop file carry, because by the time it is read there is
+    #    no console to go back to. Reaching notify_user at all means the alert
+    #    array was non-empty, so this never fires on a quiet check.
+    {
+        echo "$title"
+        echo ""
+        printf '%s\n' "${_alerts[@]}"
+        echo ""
+        echo "Host: $(hostname -s)   Full details: $ALERTS_LOG"
+    } | bash "$AGENT_DIR/ci/notify-email.sh" "[autofix] watchdog: $title"
 }
 
 log "=== Watchdog check ==="

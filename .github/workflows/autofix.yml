@@ -315,15 +315,18 @@ jobs:
           lines=$([ -f "$LOG" ] && bash ci/status-lines.sh "$LOG" || echo "(no log produced)")
 
           # Subject carries the verdict so the inbox is scannable without
-          # opening anything. Derived from the same lines as the body.
-          verdict="ran"
-          case "$lines" in
-            *"Released "*)             verdict="fixed + released" ;;
-            *"UNRELEASED"*|*"Release FAILED"*) verdict="fixed, NOT released" ;;
-            *"Closed issue"*)          verdict="fixed" ;;
-            *"All "*"attempts failed"*) verdict="FAILED" ;;
-            *"Build environment"*)     verdict="build env broken" ;;
-          esac
+          # opening anything. Built additively, not as a first-match case: one
+          # run handles several issues and can fix one while failing another,
+          # and a subject that reported only the fix would bury the failure.
+          parts=""
+          add() { parts="${parts:+$parts, }$1"; }
+          fixed=$(printf '%s\n' "$lines" | grep -c 'Closed issue' || true)
+          [ "$fixed" -gt 0 ] && add "${fixed} fixed"
+          printf '%s' "$lines" | grep -q 'attempts failed'    && add "FAILED"
+          printf '%s' "$lines" | grep -q 'Build environment'  && add "build env broken"
+          printf '%s' "$lines" | grep -q 'Released '          && add "released"
+          printf '%s' "$lines" | grep -qE 'UNRELEASED|Release FAILED' && add "NOT released"
+          verdict="${parts:-ran, no change}"
           [ "${RC:-0}" = "0" ] || verdict="$verdict (exit ${RC})"
 
           printf '%s\n\n%s\n\n%s\n' \

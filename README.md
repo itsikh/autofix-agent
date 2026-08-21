@@ -9,6 +9,9 @@ Runs in **two places at once** — see [docs/CLOUD.md](docs/CLOUD.md):
 | Local | your Mac, via `cron` | every 5 min |
 | Cloud | GitHub Actions (free) | hourly |
 
+It emails a digest whenever a run actually does something — see
+[docs/NOTIFICATIONS.md](docs/NOTIFICATIONS.md).
+
 They share work safely via the `claude-active` GitHub label, which acts as a
 cross-machine lock. If the Mac is asleep, the cloud run picks the work up.
 

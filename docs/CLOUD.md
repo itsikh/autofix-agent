@@ -136,6 +136,9 @@ sensitive is committed to this repo.
 | `BITBUCKET_SSH_KEY` | yes | Private ed25519 key for the Bitbucket-only apps (`calcvault`, `mychef`, `sosblocker`). |
 | `<APP>_KEYSTORE_BASE64` | per app | That app's release signing keystore, base64. Without it the app is fixed but **not released** here. |
 | `<APP>_KEYSTORE_PROPERTIES` | per app | The matching `keystore.properties` (store/key passwords). `storeFile` is rewritten to the runner's path. |
+| `AUTOFIX_MAIL_TO` | no | Recipient for run digests. Unset means no email; runs are unaffected. |
+| `AUTOFIX_MAIL_USER` | no | SMTP username, e.g. your Gmail address. |
+| `AUTOFIX_MAIL_PASS` | no | SMTP password — a Gmail **app password**, never the account password. |
 
 \* Set one or the other. `CLAUDE_CODE_OAUTH_TOKEN` uses the subscription you
 already pay for; `ANTHROPIC_API_KEY` adds metered API charges.
