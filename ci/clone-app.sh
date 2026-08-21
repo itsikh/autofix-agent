@@ -188,6 +188,28 @@ fi
 # Only written when absent, so an app that legitimately tracks the file (buddy)
 # keeps its real one. Never committed: these repos already gitignore it.
 KS="$DEST/keystore.properties"
+
+# buddy TRACKS its keystore.properties, so a fresh clone has one — pointing at a
+# storeFile path that exists only on the Mac. The block below would then leave it
+# alone and the release would die inside signing. Detect an unusable storeFile and
+# treat the file as if it were absent, so the CI keystore is installed over it.
+# skip-worktree keeps that edit off any commit: the file is tracked here.
+if [[ -f "$KS" ]] && [[ -n "${AUTOFIX_KEYSTORE_FILE:-}" ]]; then
+    _sf=$(grep -m1 '^storeFile=' "$KS" | cut -d= -f2-)
+    _resolved=""
+    for _base in "$DEST" "$DEST/app"; do
+        [[ -n "$_sf" && -f "$_base/$_sf" ]] && { _resolved="$_base/$_sf"; break; }
+    done
+    [[ "$_sf" == /* && -f "$_sf" ]] && _resolved="$_sf"
+    if [[ -z "$_resolved" ]]; then
+        log "tracked keystore.properties points at a storeFile that is not here — replacing it for this runner"
+        if git -C "$DEST" ls-files --error-unmatch keystore.properties >/dev/null 2>&1; then
+            git -C "$DEST" update-index --skip-worktree keystore.properties 2>/dev/null || true
+        fi
+        rm -f "$KS"
+    fi
+fi
+
 if [[ ! -f "$KS" ]] && grep -rqs "keystore.properties" "$DEST/app/build.gradle.kts" "$DEST/build.gradle.kts" 2>/dev/null; then
     # When the workflow supplied this app's real signing material, install it: a
     # placeholder is enough to configure a debug build but cannot sign a release,
