@@ -174,27 +174,84 @@ if [[ -f "$LP" ]] && [[ -n "${ANDROID_HOME:-}" ]]; then
     fi
 fi
 
-# ── Placeholder keystore.properties ─────────────────────────────────────────
-# Most apps read keystore.properties in app/build.gradle.kts but gitignore the
-# file, so a fresh clone has no copy. Gradle then dies during CONFIGURATION
-# ("null cannot be cast to non-null type kotlin.String"), which fails every
-# task including assembleDebug.
-#
-# That failure is dangerous, not merely annoying: the agent sees a broken build,
-# treats it as the bug, and "fixes" it by rewriting the release signing config —
-# committing an unrequested change that makes release builds silently unsigned.
-# A placeholder keeps configuration valid so the agent never sees the problem.
-#
-# Only written when absent, so an app that legitimately tracks the file (buddy)
-# keeps its real one. Never committed: these repos already gitignore it.
 KS="$DEST/keystore.properties"
 
+# ── Signing material ─────────────────────────────────────────────────────────
+# Three apps, three mechanisms, so this is driven by conf keys rather than by
+# special-casing slugs:
+#
+#   mylock etc.  keystore.properties at the project root, storeFile inside it
+#   mychef       RELEASE_* keys in local.properties, jks at the project root
+#   anova        release buildType signed with the DEBUG keystore, read from
+#                ~/.android/debug.keystore — its published APKs really are debug
+#                signed (verified: SHA-256 1061..4e28), so CI must use that exact
+#                file or every installed copy loses its update path
+#
+# Conf keys, all optional:
+#   SIGNING_PROPS_FILE  file the credentials go into  (default keystore.properties)
+#   KEYSTORE_PATH_KEY   property naming the keystore  (default storeFile)
+#   KEYSTORE_DEST       where the keystore file must land; {DEST} and {HOME}
+#                       are expanded  (default: leave it where it was decoded)
+SIGNING_PROPS_FILE="${SIGNING_PROPS_FILE:-keystore.properties}"
+KEYSTORE_PATH_KEY="${KEYSTORE_PATH_KEY:-storeFile}"
+
+have_real_keystore() {
+    [[ -n "${AUTOFIX_KEYSTORE_FILE:-}" && -f "${AUTOFIX_KEYSTORE_FILE}" \
+    && -n "${AUTOFIX_KEYSTORE_PROPERTIES:-}" && -f "${AUTOFIX_KEYSTORE_PROPERTIES}" ]]
+}
+
+install_signing_material() {
+    umask 077
+    local ks_abs
+    ks_abs=$(cd "$(dirname "$AUTOFIX_KEYSTORE_FILE")" && pwd)/$(basename "$AUTOFIX_KEYSTORE_FILE")
+
+    # Some builds hardcode where the keystore lives and cannot be pointed at a
+    # temp path — anova reads ~/.android/debug.keystore directly.
+    if [[ -n "${KEYSTORE_DEST:-}" ]]; then
+        local dest="${KEYSTORE_DEST//\{DEST\}/$DEST}"
+        dest="${dest//\{HOME\}/$HOME}"
+        mkdir -p "$(dirname "$dest")"
+        cp "$AUTOFIX_KEYSTORE_FILE" "$dest"
+        chmod 600 "$dest"
+        ks_abs="$dest"
+        log "keystore placed at $dest"
+    fi
+
+    local target="$DEST/$SIGNING_PROPS_FILE"
+    # Rewrite the path key to where the keystore actually is: the developer's copy
+    # holds a path relative to their machine. Never echoed — the rest is passwords.
+    local rendered
+    rendered=$(sed -E "s|^${KEYSTORE_PATH_KEY}=.*|${KEYSTORE_PATH_KEY}=${ks_abs}|" "$AUTOFIX_KEYSTORE_PROPERTIES")
+    if ! printf '%s\n' "$rendered" | grep -q "^${KEYSTORE_PATH_KEY}=${ks_abs}$"; then
+        # No such line to rewrite; add it rather than leaving the path unset, which
+        # fails deep inside packaging with an opaque error.
+        rendered="${rendered}"$'\n'"${KEYSTORE_PATH_KEY}=${ks_abs}"
+    fi
+
+    if [[ "$SIGNING_PROPS_FILE" == "keystore.properties" ]]; then
+        printf '%s\n' "$rendered" > "$target"
+    else
+        # local.properties already exists and carries sdk.dir; merge rather than
+        # replace, dropping any stale copy of the keys we are about to add.
+        local keys
+        keys=$(printf '%s\n' "$rendered" | grep -oE '^[A-Za-z_][A-Za-z0-9_.]*=' | tr -d '=' | paste -sd'|' -)
+        if [[ -f "$target" && -n "$keys" ]]; then
+            grep -vE "^(${keys})=" "$target" > "$target.tmp" || true
+            mv "$target.tmp" "$target"
+        fi
+        printf '%s\n' "$rendered" >> "$target"
+        neutralise "$SIGNING_PROPS_FILE"
+    fi
+    chmod 600 "$target"
+    log "installed real signing material into $SIGNING_PROPS_FILE — releases can be signed here"
+}
+
 # buddy TRACKS its keystore.properties, so a fresh clone has one — pointing at a
-# storeFile path that exists only on the Mac. The block below would then leave it
-# alone and the release would die inside signing. Detect an unusable storeFile and
-# treat the file as if it were absent, so the CI keystore is installed over it.
-# skip-worktree keeps that edit off any commit: the file is tracked here.
-if [[ -f "$KS" ]] && [[ -n "${AUTOFIX_KEYSTORE_FILE:-}" ]]; then
+# storeFile path that exists only on the Mac. Left alone, the release would die
+# inside signing. An unusable storeFile is treated as no file at all, so the CI
+# keystore is installed over it. skip-worktree first: the file is tracked here and
+# the replacement must never reach a commit. Runs BEFORE the install below.
+if [[ -f "$KS" ]] && have_real_keystore; then
     _sf=$(grep -m1 '^storeFile=' "$KS" | cut -d= -f2-)
     _resolved=""
     for _base in "$DEST" "$DEST/app"; do
@@ -210,31 +267,25 @@ if [[ -f "$KS" ]] && [[ -n "${AUTOFIX_KEYSTORE_FILE:-}" ]]; then
     fi
 fi
 
-if [[ ! -f "$KS" ]] && grep -rqs "keystore.properties" "$DEST/app/build.gradle.kts" "$DEST/build.gradle.kts" 2>/dev/null; then
-    # When the workflow supplied this app's real signing material, install it: a
-    # placeholder is enough to configure a debug build but cannot sign a release,
-    # and an unsigned release is the difference between "bug fixed" and "bug fixed
-    # and shipped". Both files are gitignored by these repos, and worker.sh also
-    # excludes keystore.properties from fix commits, so neither is ever pushed.
-    if [[ -n "${AUTOFIX_KEYSTORE_FILE:-}" && -f "${AUTOFIX_KEYSTORE_FILE}" \
-       && -n "${AUTOFIX_KEYSTORE_PROPERTIES:-}" && -f "${AUTOFIX_KEYSTORE_PROPERTIES}" ]]; then
-        # storeFile in the developer's copy is relative to the app module
-        # (../<app>.jks). Rewrite it to where the workflow actually decoded the
-        # keystore. Never echoed: the rest of the file is passwords.
-        KS_ABS=$(cd "$(dirname "$AUTOFIX_KEYSTORE_FILE")" && pwd)/$(basename "$AUTOFIX_KEYSTORE_FILE")
-        umask 077
-        sed -E "s|^storeFile=.*|storeFile=${KS_ABS}|" "$AUTOFIX_KEYSTORE_PROPERTIES" > "$KS"
-        if grep -q "^storeFile=${KS_ABS}$" "$KS"; then
-            log "installed real signing keystore — release builds can be signed here"
-        else
-            # No storeFile line to rewrite; add one rather than leaving it unset,
-            # which fails deep inside packaging with an opaque error.
-            echo "storeFile=${KS_ABS}" >> "$KS"
-            log "installed real signing keystore (storeFile appended)"
-        fi
-    else
-        log "writing placeholder keystore.properties (no signing secret for this app — release will be skipped)"
-        cat > "$KS" <<'KSEOF'
+# Deliberately NOT gated on the build referencing keystore.properties. anova signs
+# with the debug keystore and never mentions the file, but it still needs its key
+# placed here, and its /release pre-flight still checks that the file exists.
+if have_real_keystore; then
+    install_signing_material
+
+# ── Placeholder keystore.properties ─────────────────────────────────────────
+# Most apps read keystore.properties in app/build.gradle.kts but gitignore the
+# file, so a fresh clone has no copy. Gradle then dies during CONFIGURATION
+# ("null cannot be cast to non-null type kotlin.String"), which fails every task
+# including assembleDebug.
+#
+# That failure is dangerous, not merely annoying: the agent sees a broken build,
+# treats it as the bug, and "fixes" it by rewriting the release signing config —
+# committing an unrequested change that makes release builds silently unsigned.
+# A placeholder keeps configuration valid so the agent never sees the problem.
+elif [[ ! -f "$KS" ]] && grep -rqs "keystore.properties" "$DEST/app/build.gradle.kts" "$DEST/build.gradle.kts" 2>/dev/null; then
+    log "writing placeholder keystore.properties (no signing secret for this app — release will be skipped)"
+    cat > "$KS" <<'KSEOF'
 # Placeholder written by ci/clone-app.sh so Gradle configuration succeeds.
 # No signing secret was supplied for this app, so only debug variants can be
 # built here and worker.sh runs with RELEASE_MODE=none.
@@ -243,7 +294,6 @@ storePassword=ci-placeholder
 keyAlias=ci-placeholder
 keyPassword=ci-placeholder
 KSEOF
-    fi
 fi
 
 log "ready at $DEST"

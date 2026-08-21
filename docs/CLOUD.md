@@ -243,6 +243,46 @@ DRIFT mylock       released=v0.0.47    unreleased: 1 autofix / 3 total  unreleas
 
 ---
 
+## Signing
+
+<a name="signing"></a>Releasing from CI means signing there, and the nine apps do
+not agree on how signing works. Rather than special-casing slugs, `ci/clone-app.sh`
+is driven by three optional conf keys:
+
+| Conf key | Default | Meaning |
+|---|---|---|
+| `SIGNING_PROPS_FILE` | `keystore.properties` | Which file the credentials go into. |
+| `KEYSTORE_PATH_KEY` | `storeFile` | The property naming the keystore path. |
+| `KEYSTORE_DEST` | *(leave in place)* | Where the keystore file must land. `{DEST}` and `{HOME}` are expanded. |
+
+The three mechanisms in use:
+
+- **Most apps** — `keystore.properties` at the project root, path in `storeFile`.
+  No conf keys needed. `storeFile` is rewritten to wherever the workflow decoded
+  the keystore, so the developer's relative `../app-release.jks` needs no editing.
+- **mychef** — credentials are `RELEASE_*` keys inside `local.properties`, with
+  the keystore at the project root. Only those four keys go into the secret; the
+  rest of that file is `sdk.dir` and API keys CI must not inherit. They are
+  *merged*, so `sdk.dir` and unrelated keys survive.
+- **anova** — its `release` buildType is signed with the **debug** keystore
+  (`signingConfig = signingConfigs.getByName("debug")`), read from
+  `~/.android/debug.keystore`. This is not a CI workaround: `Anova-v0.0.40.apk`
+  really is debug-signed, signer SHA-256 `1061..4e28`, matching the debug
+  keystore on the Mac.
+
+> **Why anova's key cannot simply be regenerated.** Android identifies an app by
+> its signing key. A freshly generated debug keystore on a runner has a different
+> key, so every installed copy of Anova would refuse the update. `KEYSTORE_DEST`
+> therefore installs that exact file. Moving anova to a proper release key is
+> worth doing, but it is a one-way door — it breaks the update path for existing
+> installs — so it belongs in a deliberate decision, not in CI plumbing.
+
+Each key was verified against its app's published APK before being uploaded, by
+comparing the keystore's certificate fingerprint to the signer of the release on
+GitHub. A mismatch there would mean shipping updates nobody can install.
+
+---
+
 ## Registering an app for cloud runs
 
 On top of the normal `.conf` keys, the cloud run needs to know where to clone
