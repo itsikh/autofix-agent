@@ -26,6 +26,13 @@ name: autofix
 #                            Contents: read+write and Issues: read+write.
 #   BITBUCKET_SSH_KEY        Private SSH key (ed25519) for the Bitbucket-only
 #                            repos: calcvault, mychef, sosblocker.
+#   <APP>_KEYSTORE_BASE64    Per-app release signing keystore, base64. Optional:
+#   <APP>_KEYSTORE_PROPERTIES  an app without both keeps RELEASE_MODE=none and is
+#                            reported by ci/release-drift.sh instead of released.
+#                            Named after the app slug, e.g. MYLOCK_KEYSTORE_BASE64.
+#                            Without these the loop stops at "fix pushed": a cloud
+#                            run cannot sign, and because it closes the issue the
+#                            Mac never sees work to release either.
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -95,7 +102,11 @@ jobs:
     needs: scan
     if: needs.scan.outputs.count != '0'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # Was 90, which covered a fix and a debug build. A run now also verifies a
+    # baseline build and, where signing material exists, runs /release with
+    # testReleaseUnitTest + assembleRelease on top. mylock's cold debug build
+    # alone measured 14 minutes.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       # One app at a time. Each app pushes to shared remotes and calls /release;
@@ -107,9 +118,10 @@ jobs:
       AUTOFIX_WORKSPACE: ${{ github.workspace }}/_apps
       ANDROID_HOME: /usr/local/lib/android/sdk
       ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
-      # No signing keystore here, so /release could bump a version without ever
-      # publishing it. Fixes are pushed; the Mac cuts the release.
-      AUTOFIX_RELEASE_MODE: none
+      # AUTOFIX_RELEASE_MODE is deliberately NOT set here. It is written to
+      # $GITHUB_ENV by the "Install signing keystore" step below, which is the
+      # only place that knows whether this app can actually sign a release. A
+      # job-level value would shadow that decision.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -181,6 +193,42 @@ jobs:
             echo "key fingerprint: $(ssh-keygen -lf ~/.ssh/id_ed25519 2>&1 || echo unreadable)"
           fi
 
+      - name: Install signing keystore
+        env:
+          # Indexed by app slug so one step serves every app. Context lookups are
+          # case-insensitive, so the slug "mylock" finds MYLOCK_KEYSTORE_BASE64.
+          KEYSTORE_BASE64: ${{ secrets[format('{0}_KEYSTORE_BASE64', matrix.app)] }}
+          KEYSTORE_PROPERTIES: ${{ secrets[format('{0}_KEYSTORE_PROPERTIES', matrix.app)] }}
+          APP: ${{ matrix.app }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ] || [ -z "${KEYSTORE_PROPERTIES:-}" ]; then
+            echo "::warning::No signing secrets for ${APP} — it will be fixed but NOT released."
+            echo "Set ${APP}_KEYSTORE_BASE64 and ${APP}_KEYSTORE_PROPERTIES to close the loop."
+            echo "AUTOFIX_RELEASE_MODE=none" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          # umask first: these are real signing keys, and a world-readable copy on
+          # the runner is a needless exposure even on an ephemeral machine.
+          umask 077
+          mkdir -p "$RUNNER_TEMP/signing"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/release.jks"
+          printf '%s\n' "$KEYSTORE_PROPERTIES" > "$RUNNER_TEMP/signing/keystore.properties"
+          # Fail loudly on a truncated or mis-pasted secret rather than letting the
+          # release die later inside packaging with an opaque signing error.
+          if ! keytool -list -keystore "$RUNNER_TEMP/signing/release.jks" \
+               -storepass "$(sed -n 's/^storePassword=//p' "$RUNNER_TEMP/signing/keystore.properties")" \
+               >/dev/null 2>&1; then
+            echo "::error::${APP} keystore did not open — check ${APP}_KEYSTORE_BASE64 and storePassword."
+            exit 1
+          fi
+          echo "Signing keystore installed for ${APP} — releases enabled."
+          {
+            echo "AUTOFIX_KEYSTORE_FILE=$RUNNER_TEMP/signing/release.jks"
+            echo "AUTOFIX_KEYSTORE_PROPERTIES=$RUNNER_TEMP/signing/keystore.properties"
+            echo "AUTOFIX_RELEASE_MODE=skill"
+          } >> "$GITHUB_ENV"
+
       - name: Apply cloud Gradle settings
         run: |
           mkdir -p ~/.gradle
@@ -251,3 +299,171 @@ jobs:
               "$LOG" || echo "(no status lines matched)"
             echo "── $(wc -l < "$LOG") total lines withheld ──"
           fi
+
+  # ── The other half of the loop ──────────────────────────────────────────────
+  # A fix that is pushed but never released is invisible to the person who filed
+  # the bug: their issue reads "completed" and their app still misbehaves. That
+  # is not hypothetical — mylock #15 was fixed here on 2026-08-21, closed, and
+  # sat unreleased because this workflow could not sign and the Mac then saw no
+  # open issue to act on. These two jobs make that state unable to persist.
+  drift-scan:
+    name: Find fixes that never shipped
+    needs: fix
+    # always(): the interesting case is precisely a run where fixing went wrong.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      apps: ${{ steps.drift.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Check release drift
+        id: drift
+        env:
+          GH_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+        run: |
+          # --remote: answers this from the GitHub API instead of cloning nine
+          # Android repos every hour. Exit 1 means drift, 2 means some app could
+          # not be verified; neither should fail this job, both must be visible.
+          report=$(bash ci/release-drift.sh --remote || true)
+          echo "$report"
+          {
+            echo '## Release drift'
+            echo '```'
+            echo "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          apps=$(bash ci/release-drift.sh --remote --json 2>/dev/null \
+            | python3 -c "import json,sys; print(json.dumps([r['app'] for r in json.load(sys.stdin) if r['status']=='drift']))" \
+            || echo '[]')
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+          echo "Apps with unreleased fixes: $apps"
+
+  drift-release:
+    name: Release ${{ matrix.app }}
+    needs: drift-scan
+    if: needs.drift-scan.outputs.apps != '[]' && needs.drift-scan.outputs.apps != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      # Serialised for the same reason as the fix job: each release tags and
+      # pushes to shared remotes and publishes to GitHub.
+      max-parallel: 1
+      matrix:
+        app: ${{ fromJSON(needs.drift-scan.outputs.apps) }}
+    env:
+      AUTOFIX_WORKSPACE: ${{ github.workspace }}/_apps
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ matrix.app }}-${{ github.run_id }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ matrix.app }}-
+            gradle-${{ runner.os }}-
+
+      - name: Install Claude CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Configure git identity and credentials
+        env:
+          APP_REPO_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+        run: |
+          git config --global user.name  'autofix-agent'
+          git config --global user.email 'autofix-agent@users.noreply.github.com'
+          git config --global credential.helper \
+            '!f() { echo username=x-access-token; echo "password=${APP_REPO_TOKEN}"; }; f'
+
+      - name: Configure Bitbucket SSH
+        env:
+          BITBUCKET_SSH_KEY: ${{ secrets.BITBUCKET_SSH_KEY }}
+        run: |
+          if [ -z "${BITBUCKET_SSH_KEY:-}" ]; then
+            echo "No BITBUCKET_SSH_KEY set — Bitbucket-only apps will fail to clone."
+            exit 0
+          fi
+          umask 077
+          mkdir -p ~/.ssh
+          printf '%s\n' "$BITBUCKET_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t rsa,ed25519 bitbucket.org >> ~/.ssh/known_hosts 2>/dev/null
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Install signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets[format('{0}_KEYSTORE_BASE64', matrix.app)] }}
+          KEYSTORE_PROPERTIES: ${{ secrets[format('{0}_KEYSTORE_PROPERTIES', matrix.app)] }}
+          APP: ${{ matrix.app }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ] || [ -z "${KEYSTORE_PROPERTIES:-}" ]; then
+            echo "::error::${APP} has unreleased fixes but no signing secrets — it cannot be released here."
+            echo "Set ${APP}_KEYSTORE_BASE64 and ${APP}_KEYSTORE_PROPERTIES, or release it from the Mac."
+            exit 1
+          fi
+          umask 077
+          mkdir -p "$RUNNER_TEMP/signing"
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/signing/release.jks"
+          printf '%s\n' "$KEYSTORE_PROPERTIES" > "$RUNNER_TEMP/signing/keystore.properties"
+          {
+            echo "AUTOFIX_KEYSTORE_FILE=$RUNNER_TEMP/signing/release.jks"
+            echo "AUTOFIX_KEYSTORE_PROPERTIES=$RUNNER_TEMP/signing/keystore.properties"
+          } >> "$GITHUB_ENV"
+
+      - name: Apply cloud Gradle settings
+        run: |
+          mkdir -p ~/.gradle
+          grep -v '^org.gradle.java.home=' cloud/gradle.properties > ~/.gradle/gradle.properties
+          echo "org.gradle.java.home=${JAVA_HOME}" >> ~/.gradle/gradle.properties
+          sed -i \
+            -e 's/^org.gradle.jvmargs=.*/org.gradle.jvmargs=-Xmx5g -XX:MaxMetaspaceSize=1g -Dfile.encoding=UTF-8/' \
+            -e 's/^org.gradle.workers.max=.*/org.gradle.workers.max=4/' \
+            -e 's/^org.gradle.parallel=.*/org.gradle.parallel=true/' \
+            -e 's/^kotlin.incremental=.*/kotlin.incremental=true/' \
+            ~/.gradle/gradle.properties
+
+      - name: Clone app repo
+        env:
+          APP: ${{ matrix.app }}
+          APP_REPO_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+        run: bash ci/clone-app.sh "apps/${APP}.conf"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+          APP_REPO_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          APP: ${{ matrix.app }}
+        run: |
+          # Output is withheld for the same reason as the fix job: this repository
+          # is public and a release log carries source from private app repos.
+          mkdir -p "$RUNNER_TEMP/logs"
+          rc=0
+          bash ci/release-app.sh "apps/${APP}.conf" \
+            > "$RUNNER_TEMP/logs/${APP}-release.log" 2>&1 || rc=$?
+          grep -E '^\[release\] ' "$RUNNER_TEMP/logs/${APP}-release.log" || echo "(no status lines)"
+          exit $rc

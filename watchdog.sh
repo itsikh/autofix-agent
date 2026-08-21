@@ -10,7 +10,8 @@ set -uo pipefail
 #   3. Kill any worker running longer than MAX_AGE_MINUTES
 #   4. Clean up ALL stale lock dirs (owner dead or killed)
 #   5. Kill orphaned stuck sub-processes (git, gradlew)
-#   6. Send macOS notification + write alerts log for unfixable problems
+#   6. Report autofixed bugs that were never released, and failed cloud runs
+#   7. Send macOS notification + write alerts log for unfixable problems
 #
 # Cron example:
 #   */30 * * * * /path/to/autofix-agent/watchdog.sh >> /path/to/autofix-agent/logs/watchdog.log 2>&1
@@ -268,7 +269,49 @@ done < <(ps -ax -o pid=,etime=,command= 2>/dev/null \
     | grep -E '(git fetch|git push|gradlew)' \
     | grep -v grep)
 
-# ── Step 7: Flush alerts as a single notification ─────────────────────────────
+# ── Step 7: Did every autofixed bug actually ship? ────────────────────────────
+# The watchdog watched processes and logs and nothing else, so the one failure
+# that matters most to a user was invisible: a bug fixed, its issue closed, and
+# no release containing the fix. That is exactly what happened to mylock #15 on
+# 2026-08-21 — fixed in the cloud, which cannot sign, and then never released
+# because the Mac saw no open issues left to act on.
+if [[ -x "$AGENT_DIR/ci/release-drift.sh" ]]; then
+    drift_out=$("$AGENT_DIR/ci/release-drift.sh" 2>&1)
+    drift_rc=$?
+    echo "$drift_out" | while IFS= read -r l; do log "  $l"; done
+    if [[ $drift_rc -eq 1 ]]; then
+        while IFS= read -r l; do
+            app=$(echo "$l" | awk '{print $2}')
+            alert "$app has an autofixed bug that was never released — the issue is closed but no user has the fix."
+        done < <(echo "$drift_out" | grep '^DRIFT ')
+    elif [[ $drift_rc -eq 2 ]]; then
+        log "Release drift check could not verify every app (see rows marked '?')."
+    fi
+else
+    log "ci/release-drift.sh not executable — skipping release drift check."
+fi
+
+# ── Step 8: Did the last cloud run fail? ──────────────────────────────────────
+# The Mac and GitHub Actions share this work, so half the runs happen somewhere
+# the watchdog never looked. A red cloud run used to be visible only in email.
+if command -v gh >/dev/null 2>&1; then
+    cloud=$(gh run list --repo itsikh/autofix-agent --workflow autofix --limit 3 \
+        --json conclusion,createdAt,url -q '.[] | "\(.conclusion) \(.createdAt) \(.url)"' 2>/dev/null || echo "")
+    if [[ -z "$cloud" ]]; then
+        log "Could not read cloud run history (gh unavailable or unauthenticated)."
+    else
+        log "Recent cloud runs:"
+        echo "$cloud" | while IFS= read -r l; do log "  $l"; done
+        # Only alert on a run of consecutive failures: one red run is often a
+        # transient runner or API problem and self-heals on the next hour.
+        fails=$(echo "$cloud" | grep -c '^failure ' || true)
+        if [[ "${fails:-0}" -ge 2 ]]; then
+            alert "Cloud autofix has failed ${fails} of its last 3 runs — $(echo "$cloud" | grep -m1 '^failure ' | awk '{print $3}')"
+        fi
+    fi
+fi
+
+# ── Step 9: Flush alerts as a single notification ─────────────────────────────
 if [[ ${#_alerts[@]} -gt 0 ]]; then
     count=${#_alerts[@]}
     if [[ $count -eq 1 ]]; then

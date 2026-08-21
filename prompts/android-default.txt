@@ -13,6 +13,16 @@ Fix the following issue(s). Make minimal, targeted changes. Do not refactor unre
 3. Ensure the fix follows existing code patterns and conventions
 4. Do not add unnecessary comments, documentation, or refactoring
 5. Do not modify files unrelated to the fix
+   - This includes the build tooling itself: `gradlew`, `gradlew.bat`,
+     `gradle/wrapper/*`, `gradle.properties`, `local.properties`,
+     `keystore.properties`. If one of those is broken or missing, that is the
+     environment you were handed, not the bug you were asked to fix. Do NOT
+     repair it and do NOT commit a repair — a fix commit that also rewrites the
+     Gradle wrapper is churn nobody asked for, and it hides the real fault.
+     Instead stop and print exactly:
+     BUILD_ENV_BROKEN: <what is missing or broken, and what would fix it>
+     The agent handles that as an environment fault: it costs you no retry and
+     the issue is not blamed for it.
 6. All user-facing strings are in English
 7. Key Android constraints:
    - minSdk = 26, targetSdk = 35

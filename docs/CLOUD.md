@@ -134,9 +134,23 @@ sensitive is committed to this repo.
 | `ANTHROPIC_API_KEY` | alt* | Use *instead* of the above to bill per-token through the API. |
 | `APP_REPO_TOKEN` | yes | Fine-grained PAT for the app repos: **Contents** read+write, **Issues** read+write. |
 | `BITBUCKET_SSH_KEY` | yes | Private ed25519 key for the Bitbucket-only apps (`calcvault`, `mychef`, `sosblocker`). |
+| `<APP>_KEYSTORE_BASE64` | per app | That app's release signing keystore, base64. Without it the app is fixed but **not released** here. |
+| `<APP>_KEYSTORE_PROPERTIES` | per app | The matching `keystore.properties` (store/key passwords). `storeFile` is rewritten to the runner's path. |
 
 \* Set one or the other. `CLAUDE_CODE_OAUTH_TOKEN` uses the subscription you
 already pay for; `ANTHROPIC_API_KEY` adds metered API charges.
+
+The keystore secrets are named after the app slug — `MYLOCK_KEYSTORE_BASE64`,
+`MEDREMINDER_KEYSTORE_PROPERTIES` — and looked up dynamically with
+`secrets[format('{0}_KEYSTORE_BASE64', matrix.app)]`, so adding an app needs no
+workflow change. An app missing either secret still gets fixed; it runs with
+`AUTOFIX_RELEASE_MODE=none` and is then reported by `ci/release-drift.sh`
+instead of being released. That is a deliberate degradation, not a silent one.
+
+**These are real signing keys.** They are what makes an installed app accept an
+update, so treat them accordingly: anyone with admin on this repo, or a
+compromised Actions run, can read them. That risk buys the thing the agent
+exists for — a filed bug becoming an installable version without a human.
 
 ### How they are kept safe
 
@@ -185,6 +199,43 @@ Add each with:
 gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo itsikh/autofix-agent
 gh secret set APP_REPO_TOKEN          --repo itsikh/autofix-agent
 gh secret set BITBUCKET_SSH_KEY       --repo itsikh/autofix-agent < ~/.ssh/id_ed25519_bitbucket
+```
+
+Per-app signing material, so the cloud run can publish a release rather than
+stopping at "pushed" (`storeFile` is rewritten to the runner's path at clone
+time, so the developer's relative `../app-release.jks` needs no editing):
+
+```bash
+APP=mylock; DIR=~/dev/MyLock; JKS=$DIR/mylock-release.jks
+base64 -i "$JKS" | gh secret set "$(echo "$APP" | tr a-z A-Z)_KEYSTORE_BASE64" --repo itsikh/autofix-agent
+gh secret set "$(echo "$APP" | tr a-z A-Z)_KEYSTORE_PROPERTIES" --repo itsikh/autofix-agent < "$DIR/keystore.properties"
+```
+
+---
+
+## Closing the loop: fix → release
+
+A fix that is pushed but never released is invisible to whoever filed the bug —
+their issue reads "completed" and their app still misbehaves. Two mechanisms
+make that state unable to persist:
+
+1. **In-run release.** `worker.sh` calls `/release` in the same run that fixed
+   something, and verifies a *new* release tag actually appeared. A zero exit
+   from `/release` is not proof: it aborts in its own pre-flight and still exits
+   0. If nothing was published, the run fails.
+2. **Drift backstop.** `ci/release-drift.sh` compares each app's newest
+   published release against `main` and reports every `autofix:` commit that
+   never shipped. It runs three ways:
+   - `drift-scan` / `drift-release` jobs, hourly after `fix` — detects via the
+     GitHub API (`--remote`, no clones) and releases any app that drifted.
+   - `watchdog.sh` on the Mac, every 30 min — alerts, and covers the
+     Bitbucket-primary apps the API cannot see.
+   - by hand: `ci/release-drift.sh` for a report, `--json` for automation.
+
+```
+$ ci/release-drift.sh
+  ok  anova        released=v0.0.40    unreleased: 0 autofix / 0 total
+DRIFT mylock       released=v0.0.47    unreleased: 1 autofix / 3 total  unreleased fixes: resolve #15
 ```
 
 ---
@@ -273,8 +324,12 @@ code. Each guard below exists because that actually happened.
 | Placeholder `keystore.properties` | 6 of 9 apps read it but gitignore it. Without it Gradle dies during *configuration*, the agent treats the broken build as the bug, and rewrites the release signing config — making release builds silently unsigned. Only written when absent, so buddy keeps its tracked copy. |
 | Mirror staleness check | `worker.sh` pushes to every remote and falls back to `--force-with-lease`. If the mirror holds commits the clone lacks, a fix built here could overwrite them. buddy's GitHub mirror sat one release commit behind Bitbucket for months. Clone aborts rather than risk it. |
 | Bitbucket SSH verification | The key was written but never tested, so a bad key surfaced only as a silently failed mirror push. |
-| `AUTOFIX_RELEASE_MODE=none` | No signing keystore here, so `/release` would bump a version it can never publish. The Mac cuts releases. |
-| Build always verified in CI | `worker.sh` skips its build when Claude self-commits, on the assumption `/release` rebuilds. With releases off, that would push an unverified fix, so the build runs explicitly. |
+| `AUTOFIX_RELEASE_MODE` decided per app | Was hardcoded to `none`, which broke the loop: the cloud run fixed mylock #15 and closed it, so the Mac then saw no open issue and never released either. Now `skill` when that app has signing secrets, `none` with a warning when it does not. |
+| Build always verified before commit | `worker.sh` used to skip its own build whenever Claude self-committed, trusting `/release` to rebuild. But the issue is closed and the fix pushed *before* `/release` runs, so a broken fix would be published and announced as resolved. The build now always runs first. |
+| Wrapper jar restored | mylock and anova gitignored `gradle/wrapper/gradle-wrapper.jar`, so a fresh clone could not run `./gradlew` at all. Both repos now commit it; `ci/clone-app.sh` restores it for any app that does not. |
+| Toolchain preflight | A broken environment used to be indistinguishable from a broken fix — all three attempts on mylock #15 died on the missing wrapper jar and the issue was told it needed manual intervention. `worker.sh` now checks `./gradlew --version` before spending any Claude time, and builds a baseline in CI. |
+| Build-infra files excluded from fix commits | Working around the missing wrapper, Claude regenerated it and `git add -A` committed `gradlew`, `gradlew.bat` and `gradle-wrapper.properties` into mylock's fix for #15. Those paths are now excluded unless a conf sets `ALLOW_BUILD_INFRA_EDITS=true`. |
+| Mirror remote named after its host | Each app's `/release` names the remotes its author created (`github`, `bitbucket`); a remote called `mirror` matches none of them, so a cloud release would reach one host only. |
 
 ## Assumptions this design makes
 
