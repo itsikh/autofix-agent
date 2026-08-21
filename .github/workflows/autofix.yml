@@ -292,13 +292,45 @@ jobs:
             cat "$LOG"
           else
             echo "── status lines only (full output withheld: public repo) ──"
-            # Dispatcher/worker status lines carry no file contents or diffs.
-            # ERROR: is included deliberately — a hidden failure is far worse
-            # than the small amount of context an error message reveals.
-            grep -E '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}\] \[[a-z0-9-]+\] (ERROR|===|Task |Issue |Build |Pushed|Pushed to|Closed|No |Acquired|Released|Skipping)' \
-              "$LOG" || echo "(no status lines matched)"
+            # The regex lives in ci/status-lines.sh so this job log and the
+            # email digest below can never drift apart on which events count.
+            bash ci/status-lines.sh "$LOG" || echo "(no status lines matched)"
             echo "── $(wc -l < "$LOG") total lines withheld ──"
           fi
+
+      # Reaching this job already means a ticket was picked: the fix job is
+      # gated on scan.outputs.count != '0'. That gate is why there is no
+      # "did anything happen?" check here and no idle-hour mail.
+      - name: Email digest
+        if: always()
+        env:
+          APP: ${{ matrix.app }}
+          RC: ${{ steps.run.outputs.exit }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AUTOFIX_MAIL_TO: ${{ secrets.AUTOFIX_MAIL_TO }}
+          AUTOFIX_MAIL_USER: ${{ secrets.AUTOFIX_MAIL_USER }}
+          AUTOFIX_MAIL_PASS: ${{ secrets.AUTOFIX_MAIL_PASS }}
+        run: |
+          LOG="$RUNNER_TEMP/logs/${APP}.log"
+          lines=$([ -f "$LOG" ] && bash ci/status-lines.sh "$LOG" || echo "(no log produced)")
+
+          # Subject carries the verdict so the inbox is scannable without
+          # opening anything. Derived from the same lines as the body.
+          verdict="ran"
+          case "$lines" in
+            *"Released "*)             verdict="fixed + released" ;;
+            *"UNRELEASED"*|*"Release FAILED"*) verdict="fixed, NOT released" ;;
+            *"Closed issue"*)          verdict="fixed" ;;
+            *"All "*"attempts failed"*) verdict="FAILED" ;;
+            *"Build environment"*)     verdict="build env broken" ;;
+          esac
+          [ "${RC:-0}" = "0" ] || verdict="$verdict (exit ${RC})"
+
+          printf '%s\n\n%s\n\n%s\n' \
+            "Autofix run for ${APP}: ${verdict}" \
+            "$lines" \
+            "Full run: ${RUN_URL}" \
+            | bash ci/notify-email.sh "[autofix] ${APP}: ${verdict}"
 
   # ── The other half of the loop ──────────────────────────────────────────────
   # A fix that is pushed but never released is invisible to the person who filed
@@ -346,7 +378,19 @@ jobs:
   drift-release:
     name: Release ${{ matrix.app }}
     needs: drift-scan
-    if: needs.drift-scan.outputs.apps != '[]' && needs.drift-scan.outputs.apps != ''
+    # !cancelled() is load-bearing, not decoration. A skip propagates through the
+    # dependency graph: `fix` is skipped on every hour with no open issues, and
+    # although drift-scan still runs (always()), its own dependents inherit that
+    # skip unless they override it. Without this the backstop was dead in exactly
+    # the case it exists for — a quiet hour with a backlog. Verified against run
+    # 32532418174, where drift-scan found mylock and medreminder and this job was
+    # skipped anyway. `!cancelled()` rather than `always()` so a cancelled run
+    # does not go on to publish releases.
+    if: >-
+      !cancelled()
+      && needs.drift-scan.result == 'success'
+      && needs.drift-scan.outputs.apps != '[]'
+      && needs.drift-scan.outputs.apps != ''
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -467,3 +511,29 @@ jobs:
             > "$RUNNER_TEMP/logs/${APP}-release.log" 2>&1 || rc=$?
           grep -E '^\[release\] ' "$RUNNER_TEMP/logs/${APP}-release.log" || echo "(no status lines)"
           exit $rc
+
+      # This job only exists when drift-scan found a fix that shipped to no one,
+      # so every mail from here reports a real event. job.status carries the
+      # verdict of the publish step above without changing its exit semantics.
+      - name: Email digest
+        if: always()
+        env:
+          APP: ${{ matrix.app }}
+          STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AUTOFIX_MAIL_TO: ${{ secrets.AUTOFIX_MAIL_TO }}
+          AUTOFIX_MAIL_USER: ${{ secrets.AUTOFIX_MAIL_USER }}
+          AUTOFIX_MAIL_PASS: ${{ secrets.AUTOFIX_MAIL_PASS }}
+        run: |
+          LOG="$RUNNER_TEMP/logs/${APP}-release.log"
+          lines=$([ -f "$LOG" ] && grep -E '^\[release\] ' "$LOG" || echo "(no log produced)")
+          if [ "$STATUS" = "success" ]; then
+            verdict="drift released"
+          else
+            verdict="drift release FAILED"
+          fi
+          printf '%s\n\n%s\n\n%s\n' \
+            "${APP} had a fix that was never released. Publishing it: ${verdict}." \
+            "$lines" \
+            "Full run: ${RUN_URL}" \
+            | bash ci/notify-email.sh "[autofix] ${APP}: ${verdict}"
