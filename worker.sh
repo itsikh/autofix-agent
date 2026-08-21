@@ -505,7 +505,12 @@ verify_baseline_build() {
     if is_env_build_failure "$out"; then
         BUILD_ENV_ERROR="baseline $BUILD_TASK failed: $BUILD_ENV_ERROR"
     else
-        BUILD_ENV_ERROR="baseline $BUILD_TASK failed on untouched HEAD $(git rev-parse --short HEAD): $(echo "$out" | grep -E '^e: |error:|FAILURE:' | head -3 | tr '\n' ' ')"
+        # Deliberately NOT the compiler output. BUILD_ENV_ERROR is logged through
+        # log_error, and ci/status-lines.sh echoes every ERROR: line into a job log
+        # that is world-readable on this public repo — compile messages quote lines
+        # of a private app's source. The detail goes to the withheld log instead.
+        echo "$out" | tail -100 >> "$LOG_DIR/baseline_$(date +%Y%m%d_%H%M%S).log"
+        BUILD_ENV_ERROR="baseline $BUILD_TASK failed on untouched HEAD $(git rev-parse --short HEAD) — see the withheld run log for the compiler output"
     fi
     return 1
 }
