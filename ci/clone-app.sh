@@ -28,6 +28,9 @@ source "$CONF_FILE"
 : "${APP_SLUG:?CONF: APP_SLUG is required}"
 : "${CODE_REPO:?CONF: CODE_REPO is required for CI runs}"
 
+# Not every app's default branch is `main` — triviaapp's is `main-clean`.
+MAIN_BRANCH="${MAIN_BRANCH:-main}"
+
 DEST="${AUTOFIX_WORKSPACE}/${APP_SLUG}"
 mkdir -p "$AUTOFIX_WORKSPACE"
 
@@ -36,7 +39,7 @@ log() { echo "[clone] [$APP_SLUG] $*"; }
 if [[ -d "$DEST/.git" ]]; then
     log "already present — fetching"
     git -C "$DEST" fetch origin --prune || exit 1
-    git -C "$DEST" reset --hard origin/main || exit 1
+    git -C "$DEST" reset --hard "origin/$MAIN_BRANCH" || exit 1
 else
     # Full clone, not shallow: worker.sh rebases onto origin/main and pushes,
     # which a shallow history cannot support reliably.
@@ -76,7 +79,7 @@ if [[ -n "${CODE_REPO_MIRROR:-}" ]]; then
     # --force-with-lease. If the mirror holds commits the clone lacks, fixing
     # here and pushing could overwrite them. buddy hit exactly this: its GitHub
     # mirror sat one release commit behind Bitbucket for months.
-    if git -C "$DEST" fetch -q "$MIRROR_REMOTE" main 2>/dev/null; then
+    if git -C "$DEST" fetch -q "$MIRROR_REMOTE" "$MAIN_BRANCH" 2>/dev/null; then
         ahead=$(git -C "$DEST" rev-list --count HEAD..FETCH_HEAD 2>/dev/null || echo 0)
         if [[ "${ahead:-0}" -gt 0 ]]; then
             echo "[clone] [$APP_SLUG] ERROR: $MIRROR_REMOTE is ${ahead} commit(s) ahead of CODE_REPO." >&2

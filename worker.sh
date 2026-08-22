@@ -14,7 +14,7 @@ set -euo pipefail
 #   Required: APP_SLUG, PROJECT_DIR, BUGS_REPO
 #   Optional: LOCK_SLUG, GIT_REMOTES, PROMPT_FILE, RELEASE_MODE,
 #             BUILD_TASK, MAX_RETRIES, CLAUDE_PROMPT_MODE, CUSTOM_SCRIPT,
-#             ALLOW_BUILD_INFRA_EDITS
+#             ALLOW_BUILD_INFRA_EDITS, MAIN_BRANCH, AUTOFIX_LABEL
 ###############################################################################
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
@@ -67,6 +67,10 @@ RELEASE_MODE="${RELEASE_MODE:-skill}"
 # Releases belong on the Mac, where the real keystore lives.
 [[ -n "${AUTOFIX_RELEASE_MODE:-}" ]] && RELEASE_MODE="$AUTOFIX_RELEASE_MODE"
 BUILD_TASK="${BUILD_TASK:-assembleDebug}"
+# The branch to work on. `main` for every app except triviaapp, whose default
+# branch is `main-clean`. Hardcoding it meant that app could never run at all:
+# verify_git_state refused it before doing anything.
+MAIN_BRANCH="${MAIN_BRANCH:-main}"
 MAX_RETRIES="${MAX_RETRIES:-3}"
 CLAUDE_PROMPT_MODE="${CLAUDE_PROMPT_MODE:-arg}"
 # Build infrastructure is not app code. A fix that rewrites the Gradle wrapper or
@@ -104,7 +108,12 @@ else
     fi
 fi
 ACTIVE_LABEL="claude-active"
-AUTOFIX_LABEL="autofix"
+# The label an issue must carry to be picked up. Overridable because the app
+# writes it, not this agent: triviaapp predates the template and its in-app
+# reporter labels auto-fixable reports `auto-fix`. Renaming that in the app would
+# only affect future versions — every already-installed copy keeps filing
+# `auto-fix`, and those tickets would be invisible forever.
+AUTOFIX_LABEL="${AUTOFIX_LABEL:-autofix}"
 # Survives the run, unlike ACTIVE_LABEL. An issue the agent could not fix used to
 # end a run looking untouched — the active label is stripped on the way out and the
 # only trace was a comment. This label is the durable "the agent tried and failed"
@@ -239,22 +248,22 @@ get_remotes() {
 # retry instead of force-pushing — a force would discard the other runner's work.
 push_to_remote() {
     local remote="$1" err
-    if git push "$remote" main 2>/dev/null; then
+    if git push "$remote" "$MAIN_BRANCH" 2>/dev/null; then
         log "Pushed to '$remote'."
         return 0
     fi
-    log "Push to '$remote' rejected — fetching and rebasing onto $remote/main..."
+    log "Push to '$remote' rejected — fetching and rebasing onto $remote/$MAIN_BRANCH..."
     if ! git fetch "$remote" 2>/dev/null; then
         log_error "Could not fetch from '$remote' — not pushed."
         return 1
     fi
-    if ! git rebase --autostash "$remote/main" >/dev/null 2>&1; then
+    if ! git rebase --autostash "$remote/$MAIN_BRANCH" >/dev/null 2>&1; then
         git rebase --abort 2>/dev/null || true
-        log_error "Rebase onto $remote/main conflicted — resolve manually. Not pushed to '$remote'."
+        log_error "Rebase onto $remote/$MAIN_BRANCH conflicted — resolve manually. Not pushed to '$remote'."
         return 1
     fi
-    if err=$(git push "$remote" main 2>&1); then
-        log "Pushed to '$remote' after rebasing onto $remote/main."
+    if err=$(git push "$remote" "$MAIN_BRANCH" 2>&1); then
+        log "Pushed to '$remote' after rebasing onto $remote/$MAIN_BRANCH."
         return 0
     fi
     log_error "Push to '$remote' FAILED after rebase: $err"
@@ -265,8 +274,8 @@ verify_git_state() {
     cd "$PROJECT_DIR"
     local branch
     branch=$(git rev-parse --abbrev-ref HEAD)
-    if [[ "$branch" != "main" ]]; then
-        log_error "Not on main branch (on '$branch'). Exiting."
+    if [[ "$branch" != "$MAIN_BRANCH" ]]; then
+        log_error "Not on $MAIN_BRANCH branch (on '$branch'). Exiting."
         exit 1
     fi
     if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -279,12 +288,12 @@ verify_git_state() {
         git fetch "$remote" 2>/dev/null || true
     done < <(get_remotes)
     local origin_ahead
-    origin_ahead=$(git rev-list HEAD..origin/main --count 2>/dev/null || echo 0)
+    origin_ahead=$(git rev-list "HEAD..origin/$MAIN_BRANCH" --count 2>/dev/null || echo 0)
     if [[ "$origin_ahead" -gt 0 ]]; then
-        log "origin/main is $origin_ahead commit(s) ahead — rebasing..."
-        git rebase origin/main 2>/dev/null || {
+        log "origin/$MAIN_BRANCH is $origin_ahead commit(s) ahead — rebasing..."
+        git rebase "origin/$MAIN_BRANCH" 2>/dev/null || {
             git rebase --abort 2>/dev/null || true
-            git merge --no-edit origin/main 2>/dev/null || true
+            git merge --no-edit "origin/$MAIN_BRANCH" 2>/dev/null || true
         }
     fi
     while IFS= read -r remote; do

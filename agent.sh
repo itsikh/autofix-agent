@@ -126,6 +126,13 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
 
     PROJECT_DIR_V=$(grep -E '^PROJECT_DIR=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
 
+    # The label is per-app, not global: triviaapp's in-app reporter labels
+    # auto-fixable reports `auto-fix`. This check and worker.sh must agree, or the
+    # dispatcher queues an app whose worker then finds nothing — or worse, skips
+    # an app that does have work.
+    LABEL_V=$(grep -E '^AUTOFIX_LABEL=' "$conf" | head -1 | cut -d= -f2- | tr -d '"')
+    LABEL_V="${LABEL_V:-autofix}"
+
     # Quick check: any open autofix issues that nobody is already working on?
     #
     # Issues labelled claude-active are excluded. That label is how a run claims
@@ -135,7 +142,7 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
     count=$(run_with_timeout gh issue list \
         --repo "$BUGS_REPO_V" \
         --state open \
-        --label autofix \
+        --label "$LABEL_V" \
         --json number,labels \
         --limit 50 \
         2>/dev/null \

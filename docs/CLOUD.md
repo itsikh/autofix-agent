@@ -321,16 +321,30 @@ with `APP_REPO_TOKEN` and needs no SSH key.
 | sosblocker | Bitbucket (SSH) | — |
 | ~~triviaapp~~ | **disabled** | — |
 
-**triviaapp is disabled**, and needs three separate fixes before it could work:
+**triviaapp is enabled and Mac-only.** It predates the shared template, and each
+reason it had been written off turned out to be a wrong assumption on this side
+rather than something missing in the app:
 
-1. `BUGS_REPO="itsikh/triviaapp"` does not exist on GitHub, so every issue
-   lookup failed silently — on the Mac as well as in CI.
-2. Its default branch is **`main-clean`**, but `worker.sh` refuses to run on any
-   branch except `main` (`worker.sh:210`) and pushes `main` explicitly.
-3. It has no `CODE_REPO`, so it is not eligible for CI.
+1. `BUGS_REPO` pointed at `itsikh/triviaapp`, which does not exist — every lookup
+   failed silently. The app has always filed to **`itsikh/trivia-releases`**
+   (`admin/BugReportManager.kt`, `GITHUB_REPO`).
+2. Its label is **`auto-fix`**, not `autofix`. `BugReportManager`'s `FixMode` enum
+   writes `auto-fix` for "Claude fixes automatically" and `needs-review` for
+   "propose a plan first", so only the former may be picked up. Hence per-app
+   `AUTOFIX_LABEL` — renaming it in the app would strand every ticket filed by an
+   already-installed copy.
+3. Its default branch is **`main-clean`**. Hence per-app `MAIN_BRANCH`.
+4. It is Views + XML, no Compose, no Hilt, Hebrew/RTL, minSdk 24 — the default
+   prompt asserts the opposite of all four, so it has its own `prompts/triviaapp.txt`.
 
-It also carries 3 unpushed local commits touching `scripts/claude-autofix*.sh`,
-the deprecated Gen1 scripts this repo replaced. They were left alone.
+It is **not CI-eligible**, but not for size: the earlier 1.7 GB figure was one
+unpushed Gen1 auto-commit that had force-added a 3.6 GB emulator system image.
+That commit is dropped, `.git` is now 11 MB, and the two real fixes buried in
+those commits (`unset CLAUDECODE`, a bounded `git pull`) were salvaged. The
+blocker is that its `/release` needs a sibling `${PROJECT_DIR}_release` clone for
+`latest.json`, which no runner has. Its keystore and `google-services.json` are
+both tracked, so it needs no signing secret — only that one change stands
+between it and the cloud.
 
 ---
 
@@ -376,10 +390,11 @@ code. Each guard below exists because that actually happened.
 
 ## Assumptions this design makes
 
-- **Every app's default branch is `main`.** `worker.sh` rebases onto
-  `origin/main`, pushes `main`, and refuses to run on any other branch;
-  `ci/clone-app.sh` resets to `origin/main`. Verified true for all 9 enabled
-  apps. A `master`-based app would need changes in `worker.sh` first.
+- **The branch and the trigger label are per-app, not global.** `MAIN_BRANCH`
+  (default `main`) and `AUTOFIX_LABEL` (default `autofix`) are read from the conf
+  by `worker.sh`, `agent.sh` and `ci/clone-app.sh`. Both were hardcoded, and both
+  assumptions were false for triviaapp — which is why it looked broken rather
+  than merely different.
 - **An app without `CODE_REPO` is Mac-only.** `agent.sh --list-json` skips it, so
   it never reaches CI. Local runs are unaffected.
 - **`.autofix-logs` is never committed.** `worker.sh` excludes it via pathspec
