@@ -233,15 +233,32 @@ get_remotes() {
     done <<< "$list"
 }
 
+# A run takes tens of minutes, and the CI runner pushes to the same branch while
+# it does. A "fetch first" rejection is therefore routine, not exceptional: the
+# remote simply moved after verify_git_state synced. Rebase onto the remote and
+# retry instead of force-pushing — a force would discard the other runner's work.
 push_to_remote() {
-    local remote="$1"
+    local remote="$1" err
     if git push "$remote" main 2>/dev/null; then
+        log "Pushed to '$remote'."
         return 0
     fi
-    log "Fast-forward push to $remote rejected — retrying with --force-with-lease..."
-    local err
-    err=$(git push "$remote" main --force-with-lease 2>&1) || \
-        log_error "Could not push to $remote: $err"
+    log "Push to '$remote' rejected — fetching and rebasing onto $remote/main..."
+    if ! git fetch "$remote" 2>/dev/null; then
+        log_error "Could not fetch from '$remote' — not pushed."
+        return 1
+    fi
+    if ! git rebase --autostash "$remote/main" >/dev/null 2>&1; then
+        git rebase --abort 2>/dev/null || true
+        log_error "Rebase onto $remote/main conflicted — resolve manually. Not pushed to '$remote'."
+        return 1
+    fi
+    if err=$(git push "$remote" main 2>&1); then
+        log "Pushed to '$remote' after rebasing onto $remote/main."
+        return 0
+    fi
+    log_error "Push to '$remote' FAILED after rebase: $err"
+    return 1
 }
 
 verify_git_state() {
@@ -272,7 +289,7 @@ verify_git_state() {
     fi
     while IFS= read -r remote; do
         [[ -z "$remote" ]] && continue
-        push_to_remote "$remote"
+        push_to_remote "$remote" || true
     done < <(get_remotes)
     log "Git state verified."
 }
@@ -940,13 +957,7 @@ for i in issues: print(i["number"])')
             local push_failed=false
             while IFS= read -r remote; do
                 [[ -z "$remote" ]] && continue
-                local push_err
-                if ! push_err=$(git push "$remote" main 2>&1); then
-                    log_error "Push to '$remote' FAILED: $push_err"
-                    push_failed=true
-                else
-                    log "Pushed to '$remote'."
-                fi
+                push_to_remote "$remote" || push_failed=true
             done < <(get_remotes)
             if [[ "$push_failed" == "true" ]]; then
                 log_error "Round $round: fixes committed but NOT pushed."
@@ -976,4 +987,8 @@ for i in issues: print(i["number"])')
 }
 
 set -o pipefail
-main "$@" 2>&1 | tee -a "$LOG_DIR/autofix_$(date +%Y%m%d).log"
+# The pipeline runs main() in a subshell, and bash skips a subshell's EXIT trap
+# when its last command merely returns — so cleanup() never ran and every run
+# leaked its lockdir and temp dir. An explicit exit makes the trap fire; pipefail
+# keeps main()'s status as the script's status.
+{ main "$@"; exit $?; } 2>&1 | tee -a "$LOG_DIR/autofix_$(date +%Y%m%d).log"
