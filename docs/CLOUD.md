@@ -264,11 +264,10 @@ The three mechanisms in use:
   the keystore at the project root. Only those four keys go into the secret; the
   rest of that file is `sdk.dir` and API keys CI must not inherit. They are
   *merged*, so `sdk.dir` and unrelated keys survive.
-- **anova** — its `release` buildType is signed with the **debug** keystore
-  (`signingConfig = signingConfigs.getByName("debug")`), read from
-  `~/.android/debug.keystore`. This is not a CI workaround: `Anova-v0.0.40.apk`
-  really is debug-signed, signer SHA-256 `1061..4e28`, matching the debug
-  keystore on the Mac.
+- **anova** — its `release` buildType reuses the local debug keystore rather than
+  a dedicated release key, read from `~/.android/debug.keystore`. Verified against
+  the published APK's signer, so this is the app's actual arrangement and not a CI
+  workaround.
 
 > **Why anova's key cannot simply be regenerated.** Android identifies an app by
 > its signing key. A freshly generated debug keystore on a runner has a different
