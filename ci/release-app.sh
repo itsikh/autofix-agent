@@ -66,4 +66,20 @@ if [[ -z "$after_tag" || "$after_tag" == "$before_tag" ]]; then
     die "no new release appeared — still at '${before_tag:-none}'"
 fi
 
-log "released $after_tag (was ${before_tag:-none})"
+# A new tag is not a shippable release. `gh release create` with an asset
+# attached creates a draft, uploads, and publishes only when the upload
+# completes — so a killed or timed-out upload leaves the tag in place on a draft
+# holding nothing. That is the worst possible outcome for an unattended run: it
+# looks released, the loop reports success, and no device can install it. Seen
+# for real on triviaapp v0.9.225, where a 13 MB APK outran the upload window.
+draft=$(gh release view "$after_tag" --repo "$BUGS_REPO" --json isDraft -q .isDraft 2>/dev/null || echo "unknown")
+assets=$(gh release view "$after_tag" --repo "$BUGS_REPO" --json assets -q '[.assets[].name] | length' 2>/dev/null || echo 0)
+
+if [[ "$draft" != "false" ]]; then
+    die "$after_tag exists but is a draft (isDraft=$draft) — the upload never finished, so nothing shipped"
+fi
+if [[ "${assets:-0}" -lt 1 ]]; then
+    die "$after_tag is published but carries no assets — there is nothing for a device to download"
+fi
+
+log "released $after_tag with $assets asset(s) (was ${before_tag:-none})"
