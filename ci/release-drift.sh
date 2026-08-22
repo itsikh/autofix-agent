@@ -85,7 +85,7 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
     (
         # Subshell per app: confs are sourced, and one app's variables must not
         # leak into the next. Values needed after this block go through row().
-        unset APP_SLUG PROJECT_DIR PROJECT_DIR_CLOUD BUGS_REPO ENABLED CODE_REPO
+        unset APP_SLUG PROJECT_DIR PROJECT_DIR_CLOUD BUGS_REPO ENABLED CODE_REPO MAIN_BRANCH
         # shellcheck disable=SC1090
         source "$conf"
 
@@ -118,7 +118,7 @@ for conf in "$AGENT_DIR/apps"/*.conf; do
             esac
             # compare returns 404 when the tag is absent from the code repo, which
             # is itself the answer: the release exists but its tag never landed.
-            cmp_json=$(gh api "repos/${gh_repo}/compare/${released}...main" 2>/dev/null || echo "")
+            cmp_json=$(gh api "repos/${gh_repo}/compare/${released}...${MAIN_BRANCH:-main}" 2>/dev/null || echo "")
             if [[ -z "$cmp_json" ]]; then
                 echo "ROW|$APP_SLUG|tag-missing|$released|0|0|tag $released is not in ${gh_repo} — cannot compare"
                 exit 0
@@ -147,21 +147,31 @@ print(len(msgs), len(fix), ",".join(fix)[:120] or "-")
 
         # Compare against the remote branch, never the local checkout: a Mac that
         # has not pulled would otherwise report drift that does not exist, or miss
-        # drift that does. Fall back to local main only if there is no remote ref.
-        head_ref="origin/main"
-        git -C "$PROJECT_DIR" rev-parse -q --verify "refs/remotes/origin/main" >/dev/null 2>&1 || head_ref="main"
+        # drift that does. Fall back to the local branch only if there is no remote
+        # ref. MAIN_BRANCH because triviaapp's default branch is main-clean — with
+        # `main` hardcoded here it would have reported that app as unverifiable.
+        BR="${MAIN_BRANCH:-main}"
+        head_ref="origin/$BR"
+        git -C "$PROJECT_DIR" rev-parse -q --verify "refs/remotes/origin/$BR" >/dev/null 2>&1 || head_ref="$BR"
 
         base="$released"
         if ! git -C "$PROJECT_DIR" rev-parse -q --verify "refs/tags/$released" >/dev/null 2>&1; then
-            # The Bitbucket-primary apps (calcvault, mychef, sosblocker) publish
-            # releases to a separate GitHub repo and have no tags on the code
-            # remote at all — calcvault's origin has none. Fall back to the commit
-            # /release makes when it bumps the version, which every app has:
-            #   git commit -m "chore: release v<version>"
-            base=$(git -C "$PROJECT_DIR" log --format='%H %s' "$head_ref" 2>/dev/null \
-                | grep -m1 -F "chore: release ${released}" | cut -d' ' -f1)
+            # Apps whose releases are published to a SEPARATE GitHub repo have no
+            # tags on the code remote at all — calcvault, mychef and triviaapp are
+            # all like this. Fall back to the commit their /release makes when it
+            # bumps the version. Three conventions are in use, so try each:
+            #   chore: release v0.0.47        template apps
+            #   Release v0.0.61 (build 61)    calcvault, mychef
+            #   Bump version to 0.9.224       triviaapp
+            bare="${released#v}"
+            base=""
+            for anchor in "chore: release ${released}" "Release ${released}" "Bump version to ${bare}"; do
+                base=$(git -C "$PROJECT_DIR" log --format='%H %s' "$head_ref" 2>/dev/null \
+                    | grep -m1 -F "$anchor" | cut -d' ' -f1)
+                [[ -n "$base" ]] && break
+            done
             if [[ -z "$base" ]]; then
-                echo "ROW|$APP_SLUG|tag-missing|$released|0|0|no tag $released and no \"chore: release $released\" commit — cannot compare"
+                echo "ROW|$APP_SLUG|tag-missing|$released|0|0|no tag $released and no recognised version-bump commit — cannot compare"
                 exit 0
             fi
         fi
