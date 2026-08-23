@@ -65,8 +65,13 @@ do NOT apply here. Read this section before assuming anything:
      (`nearby/`) and Firebase (`firebase/`), selected by the `Transport` enum in
      `multiplayer/`. There is no Bluetooth: that transport was deleted, so do not
      add a branch for it. A protocol or message-format change must stay
-     compatible with clients running the currently released version — new fields
-     on a wire type need defaults so an older peer can still parse the payload
+     compatible with clients running the currently released version. Note that a
+     Kotlin default is NOT enough on its own: Gson only uses the no-arg
+     constructor when EVERY parameter has a default, and otherwise allocates the
+     object directly and writes fields, skipping all defaults — so a missing
+     field comes back null inside a non-null Kotlin type and blows up at the
+     first dereference. Either give every parameter a default, or declare the
+     field nullable so the compiler makes you handle it
    - The round rules (points, ranks, streaks, shields, freeze, sabotage) live in
      `multiplayer/GameEngine.kt` and are unit-tested. Fix a scoring bug there,
      with a test, not inside an Activity
