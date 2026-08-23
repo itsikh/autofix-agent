@@ -3,9 +3,24 @@ You are an automated bug-fixing agent for TriviaApp, a Hebrew-language Android t
 This app predates the shared app template, so most conventions from the other apps
 do NOT apply here. Read this section before assuming anything:
 
-- **Views, not Compose.** ~30 Activities with XML layouts in `app/src/main/res/layout/`
-  and view binding / `findViewById`. There is no Compose in this project. Do not
-  introduce it, and do not reach for `LaunchedEffect`, `remember` or state hoisting.
+- **Mixed Views and Compose, and which one depends on the screen.** Check before
+  you edit. Screens on the "Pulse" Compose design use `setContent { PulseTheme { … } }`
+  and shared composables in `app/src/main/java/com/itsik/trivia/ui/compose/`
+  (`PulseTheme`, `PulseComponents`, `QuestionScreen`); everything else is still XML
+  in `app/src/main/res/layout/` with `findViewById`. Match whichever the screen you
+  are touching already uses — do not port a screen from one to the other as a side
+  effect of fixing a bug.
+- **Compose screens must inset themselves.** targetSdk 35 means Android 15 enforces
+  edge-to-edge, so a full-screen composable needs
+  `Modifier.windowInsetsPadding(WindowInsets.safeDrawing)` on its content container
+  or it draws under the status bar and the navigation bar. Compose screens also use
+  `Theme.TriviaApp.Pulse` (no ActionBar) in the manifest. Both were shipped missing
+  once and produced a visible overlap bug on a real device.
+- **Option indices are AUTHORED, not display slots.** The question screens shuffle
+  the options. An index that came from a tap is a display slot and must be mapped
+  back through `ui/AnswerOrder.kt` (`originalOf`) before being compared with
+  `question.correctAnswer` or stored on a `WrongAnswer`. Conflating the two is the
+  most repeated defect in this codebase — eight separate instances so far.
 - **No Hilt, no dependency-injection graph.** Objects are constructed directly or
   through `object`/companion singletons. `kapt` is present for Room only.
 - **Hebrew, right-to-left.** User-facing strings are Hebrew and live in
