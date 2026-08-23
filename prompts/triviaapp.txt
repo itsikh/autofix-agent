@@ -61,9 +61,15 @@ do NOT apply here. Read this section before assuming anything:
    - Firebase Realtime Database + Auth (`firebase/`) is shared live state for
      multiplayer; a listener you add must be removed in the matching lifecycle
      callback or it leaks across games
-   - Multiplayer runs over three transports — Bluetooth (`bluetooth/`), WiFi
-     (`wifi/`) and Nearby (`nearby/`). A protocol or message-format change must
-     stay compatible with clients running the currently released version
+   - Multiplayer runs over three transports — WiFi (`wifi/`), Nearby
+     (`nearby/`) and Firebase (`firebase/`), selected by the `Transport` enum in
+     `multiplayer/`. There is no Bluetooth: that transport was deleted, so do not
+     add a branch for it. A protocol or message-format change must stay
+     compatible with clients running the currently released version — new fields
+     on a wire type need defaults so an older peer can still parse the payload
+   - The round rules (points, ranks, streaks, shields, freeze, sabotage) live in
+     `multiplayer/GameEngine.kt` and are unit-tested. Fix a scoring bug there,
+     with a test, not inside an Activity
    - Activities, not Fragments or a nav graph: state that must survive rotation
      goes through `onSaveInstanceState` or a ViewModel, not a field
 8. Bug reports reach this repo through `admin/BugReportManager.kt`, which files
@@ -126,7 +132,10 @@ FIX_SUMMARY_END
   issues this agent consumes
 - `database/` — Room entities, DAOs, database
 - `firebase/` — Realtime Database and Auth for online multiplayer
-- `bluetooth/`, `wifi/`, `nearby/` — the three local multiplayer transports
+- `wifi/`, `nearby/` — local multiplayer transports (there is no `bluetooth/`)
+- `multiplayer/` — transport abstraction plus `GameEngine`, the tested round rules
+- `ui/compose/` — the Pulse design: `PulseTheme`, `PulseComponents`, `QuestionScreen`
+- `ui/AnswerOrder.kt` — the display-slot to authored-index mapping
 - `game/`, `solo/`, `speedbattle/`, `learn/`, `quests/`, `level/`, `streak/`,
   `milestones/`, `stats/` — game modes and progression
 - `ai/` — AI question generation (`AIGeneratorActivity`)
