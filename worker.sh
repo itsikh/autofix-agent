@@ -693,8 +693,11 @@ try_fix_task() {
         # the whole file republishes every failed attempt's report too: mylock #15
         # was closed carrying two contradictory summaries, the first describing a
         # timeout value the committed code never had.
-        local attempt_offset
-        attempt_offset=$(wc -c < "$task_log" 2>/dev/null || echo 0)
+        # -f first: on attempt 1 the log does not exist yet, and a bare
+        # redirection from a missing file makes bash print "No such file or
+        # directory" against this line — noise that reads like the run's fault.
+        local attempt_offset=0
+        [[ -f "$task_log" ]] && attempt_offset=$(wc -c < "$task_log")
 
         local prompt
         prompt=$(build_prompt "$issues_desc" "$retry_context")
@@ -806,6 +809,21 @@ clear_stuck_label() {
         --remove-label "$STUCK_LABEL" 2>/dev/null || true
 }
 
+# -p ends the session the moment the model stops its turn, so a backgrounded
+# command is killed rather than awaited. On 2026-08-22 triviaapp #111 was fixed,
+# pushed and closed, then /release bumped the version, sent `./gradlew
+# assembleRelease` to the background because the verify build's Gradle daemon was
+# still busy, said it would report back on completion, and exited — steps 3-8
+# (APK, gh release create, latest.json) never ran and nothing was published.
+readonly RELEASE_SESSION_RULE="You are running non-interactively: this session \
+ends the moment you stop your turn, there is no user to report back to and there \
+is no later turn in which to finish. Run every command in the foreground and wait \
+for it to return. Never run a command in the background, and never end your turn \
+while any work is still outstanding. Needing to start a fresh Gradle daemon \
+because another build still holds one is normal and costs about a minute — wait \
+for it, do not background the build. Stop only once every step of the release has \
+completed or one has failed, and then say which."
+
 # ── Release Trigger ───────────────────────────────────────────────────────────
 trigger_release() {
     if [[ "$RELEASE_MODE" == "none" ]]; then
@@ -827,7 +845,9 @@ trigger_release() {
     log "Triggering release via Claude CLI (/release)..."
     cd "$PROJECT_DIR"
     local rel_exit=0
-    claude --dangerously-skip-permissions -p "/release" </dev/null 2>&1 || rel_exit=$?
+    claude --dangerously-skip-permissions \
+        --append-system-prompt "$RELEASE_SESSION_RULE" \
+        -p "/release" </dev/null 2>&1 || rel_exit=$?
     if [[ $rel_exit -ne 0 ]]; then
         log_error "Release FAILED (claude exit $rel_exit). Fixes are pushed but unreleased."
         RELEASE_FAILED=true
