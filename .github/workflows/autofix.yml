@@ -176,7 +176,12 @@ jobs:
           # escapes. Written under umask 077 so it is never world-readable.
           printf '%s\n' "$BITBUCKET_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -t rsa,ed25519 bitbucket.org >> ~/.ssh/known_hosts 2>/dev/null
+          # Bitbucket moved SSH to ssh.bitbucket.org (12 Nov 2026) with the same host keys.
+          # Redirect the old name there, so every git@bitbucket.org URL in apps/*.conf keeps
+          # working, and record the keys under the name ssh checks (HostKeyAlias).
+          printf 'Host bitbucket.org\n    HostName ssh.bitbucket.org\n    HostKeyAlias bitbucket.org\n' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          ssh-keyscan -t rsa,ed25519 ssh.bitbucket.org 2>/dev/null | sed 's/^ssh\.bitbucket\.org/bitbucket.org/' >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
           # Prove the key actually authenticates. Without this, a bad key only
           # surfaces later as a silent mirror-push failure. Non-fatal: apps
@@ -456,7 +461,12 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$BITBUCKET_SSH_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan -t rsa,ed25519 bitbucket.org >> ~/.ssh/known_hosts 2>/dev/null
+          # Bitbucket moved SSH to ssh.bitbucket.org (12 Nov 2026) with the same host keys.
+          # Redirect the old name there, so every git@bitbucket.org URL in apps/*.conf keeps
+          # working, and record the keys under the name ssh checks (HostKeyAlias).
+          printf 'Host bitbucket.org\n    HostName ssh.bitbucket.org\n    HostKeyAlias bitbucket.org\n' >> ~/.ssh/config
+          chmod 600 ~/.ssh/config
+          ssh-keyscan -t rsa,ed25519 ssh.bitbucket.org 2>/dev/null | sed 's/^ssh\.bitbucket\.org/bitbucket.org/' >> ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
       - name: Install signing keystore

@@ -142,6 +142,9 @@ if [[ ! -f "$SSH_KEY" ]]; then
     cat >> "${HOME}/.ssh/config" <<SSHCONF
 
 Host bitbucket.org
+    # Bitbucket moved SSH to ssh.bitbucket.org on 12 Nov 2026 (same host keys).
+    HostName ssh.bitbucket.org
+    HostKeyAlias bitbucket.org
     IdentityFile ${SSH_KEY}
     StrictHostKeyChecking no
 SSHCONF
