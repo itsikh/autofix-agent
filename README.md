@@ -120,13 +120,19 @@ autofix-agent/
 ├── docs/
 │   └── CLOUD.md        ← cloud setup, secrets, sizing data
 ├── apps/               ← per-app config files
+│   ├── anova.conf
+│   ├── buddy.conf
+│   ├── calcvault.conf
+│   ├── callguard.conf
+│   ├── cash.conf
+│   ├── finnencer.conf
+│   ├── medreminder.conf
 │   ├── mychef.conf
 │   ├── mylock.conf
-│   ├── medreminder.conf
-│   ├── anova.conf
-│   ├── callguard.conf
+│   ├── myradio.conf
 │   ├── sosblocker.conf
-│   └── triviaapp.conf
+│   ├── triviaapp.conf
+│   └── wakecast.conf
 ├── prompts/            ← Claude prompt templates
 │   └── android-default.txt
 └── logs/               ← runtime logs (gitignored)

@@ -133,7 +133,7 @@ sensitive is committed to this repo.
 | `CLAUDE_CODE_OAUTH_TOKEN` | yes* | Claude auth via your **subscription**. Generate with `claude setup-token`. |
 | `ANTHROPIC_API_KEY` | alt* | Use *instead* of the above to bill per-token through the API. |
 | `APP_REPO_TOKEN` | yes | Fine-grained PAT for the app repos: **Contents** read+write, **Issues** read+write. |
-| `BITBUCKET_SSH_KEY` | yes | Private ed25519 key for the Bitbucket-only apps (`calcvault`, `mychef`, `sosblocker`). |
+| `BITBUCKET_SSH_KEY` | yes | Private ed25519 key for the Bitbucket-only apps (`calcvault`, `cash`, `mychef`, `sosblocker`). |
 | `<APP>_KEYSTORE_BASE64` | per app | That app's release signing keystore, base64. Without it the app is fixed but **not released** here. |
 | `<APP>_KEYSTORE_PROPERTIES` | per app | The matching `keystore.properties` (store/key passwords). `storeFile` is rewritten to the runner's path. |
 | `AUTOFIX_MAIL_TO` | no | Recipient for run digests. Unset means no email; runs are unaffected. |
@@ -315,7 +315,10 @@ with `APP_REPO_TOKEN` and needs no SSH key.
 | finnencer | GitHub | Bitbucket |
 | mylock | GitHub | Bitbucket |
 | medreminder | GitHub | — |
+| myradio | GitHub | Bitbucket |
+| wakecast | GitHub | — |
 | calcvault | Bitbucket (SSH) | — |
+| cash | Bitbucket (SSH) | — |
 | mychef | Bitbucket (SSH) | — |
 | sosblocker | Bitbucket (SSH) | — |
 | ~~triviaapp~~ | **disabled** | — |
