@@ -166,6 +166,12 @@ run_with_timeout() {
 cleanup() {
     rm -rf "$LOCK_DIR"
     [[ -n "$WORK_TMP" ]] && rm -rf "$WORK_TMP"
+    # Stop leftover Gradle/Kotlin daemons so a shared idle-shutdown VM can sleep.
+    if [[ -n "${PROJECT_DIR:-}" && -x "$PROJECT_DIR/gradlew" ]]; then
+        (cd "$PROJECT_DIR" && ./gradlew --stop) >/dev/null 2>&1 || true
+    fi
+    # ./gradlew --stop does not stop the Kotlin compiler daemon
+    pkill -u "$USER" -f 'org.jetbrains.kotlin.daemon.KotlinCompileDaemon' >/dev/null 2>&1 || true
     log "Lock released, exiting."
 }
 
