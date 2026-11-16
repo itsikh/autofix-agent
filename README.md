@@ -163,10 +163,12 @@ Group related issues into a single Claude task by adding the same `story:<name>`
 | `LOCK_SLUG` | | `APP_SLUG` | Lock dir name: `/tmp/<LOCK_SLUG>-autofix.lockdir` |
 | `GIT_REMOTES` | | `auto` | `auto` or space-separated remote names |
 | `PROMPT_FILE` | | `android-default` | Prompt template name (no `.txt`) |
-| `RELEASE_MODE` | | `skill` | `skill`, `none`, or `manual` (fix is pushed, a person releases; not reported as drift) |
+| `RELEASE_MODE` | | `skill` | `skill`, `none`, or `manual` (fix is pushed, a person releases; still shows in release-drift reports) |
 | `BUILD_TASK` | | `assembleDebug` | Gradle task to verify the fix |
 | `BUILD_CMD` | | — | Shell command (run in the project dir) that replaces `./gradlew $BUILD_TASK` for non-Gradle apps |
 | `APPROVED_BY` | | — | Comma-separated GitHub logins. When set, an issue is only taken if its `AUTOFIX_LABEL` was added by one of them and the title/body were not edited afterwards (fails closed) |
+| `BUILD_ENV_CHECK_CMD` | | — | Toolchain probe for `BUILD_CMD` apps (e.g. `node -v && go version`) |
+| `PROTECTED_PATHS` | | — | Git pathspecs a fix must not touch; touching one fails the attempt |
 | `MAX_RETRIES` | | `3` | Fix attempts before giving up |
 | `CLAUDE_PROMPT_MODE` | | `arg` | `arg` or `stdin` |
 | `CRON_INTERVAL` | | `5` | Expected minutes between runs (watchdog health check) |
