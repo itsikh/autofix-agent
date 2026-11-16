@@ -33,7 +33,7 @@ issue 5 null "$(ev itsikh 2026-11-16T10:00:00Z),{\"__typename\":\"RenamedTitleEv
 issue 6 '"2026-11-16T09:00:00Z"' "$(ev someone 2026-11-16T08:00:00Z),$(ev ItsikH 2026-11-16T10:00:00Z)" # edit before approval, case-insensitive → kept
 issue 7 null "$(ev itsikh 2026-11-16T10:00:00Z bug)"                               # approver added another label only → dropped
 issue 9 null "$(ev itsikh 2026-11-16T07:00:00Z)"                                   # labelled while filing → dropped
-issue 10 '"2026-11-16T10:00:00Z"' "$(ev itsikh 2026-11-16T10:00:00Z)"             # edit in the same second as approval → kept
+issue 10 '"2026-11-16T10:00:00Z"' "$(ev itsikh 2026-11-16T10:00:00Z)"             # edit in the same second as approval → dropped (ties fail closed)
 issue 11 null "$(ev someone 2026-11-16T10:00:00Z),$(ev itsikh 2026-11-16T10:00:00Z)" # same-second tie: timeline order wins → kept
 issue 12 null "$(ev itsikh 2026-11-16T10:00:00Z),$(ev someone 2026-11-16T10:00:00Z)" # same-second tie, other last → dropped
 # issue 8: no fake response → API failure → dropped (fail closed)
@@ -42,7 +42,7 @@ echo '[{"number":1,"title":"raw","body":"raw [//]: # (hidden)"},{"number":2},{"n
 BUGS_REPO="itsikh/example" APPROVED_BY="itsikh, other" AUTOFIX_LABEL="approved"
 filter_approved "$WORK_TMP/issues.json"
 got=$(python3 -c 'import json,sys; print(" ".join(str(i["number"]) for i in json.load(open(sys.argv[1]))))' "$WORK_TMP/issues.json")
-if [[ "$got" == "1 6 10 11" ]]; then echo "PASS approval gate ($got)"; else echo "FAIL approval gate: got '$got', want '1 6 10 11'"; exit 1; fi
+if [[ "$got" == "1 6 11" ]]; then echo "PASS approval gate ($got)"; else echo "FAIL approval gate: got '$got', want '1 6 11'"; exit 1; fi
 body=$(python3 -c 'import json,sys; i=json.load(open(sys.argv[1]))[0]; print(i["title"]+"|"+i["body"])' "$WORK_TMP/issues.json")
 if [[ "$body" == "T1|rendered 1" ]]; then echo "PASS approved issues carry the rendered text"; else echo "FAIL rendered text: $body"; exit 1; fi
 

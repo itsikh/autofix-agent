@@ -476,7 +476,7 @@ if ((last.get("actor") or {}).get("login") or "").lower() not in approvers:
 # text that was approved.
 edits = [issue.get("lastEditedAt")] + [e.get("createdAt") for e in nodes
                                        if e.get("__typename") == "RenamedTitleEvent"]
-if any(t and t > last["createdAt"] for t in edits):
+if any(t and t >= last["createdAt"] for t in edits):
     sys.exit(1)
 # What Claude gets is what GitHub renders as text: no comments, link-reference lines,
 # tag attributes or other markup that is invisible on the page.
@@ -613,7 +613,17 @@ is_env_build_failure() {
 # otherwise the Gradle task.
 run_build() {
     if [[ -n "$BUILD_CMD" ]]; then
-        (cd "$PROJECT_DIR" && bash -c "$BUILD_CMD") 2>&1
+        # Gated apps: the build runs code the fix session wrote (tests, configs), so it
+        # gets the same no-GitHub environment as that session.
+        local ge=()
+        if [[ -n "$APPROVED_BY" ]]; then
+            mkdir -p "$WORK_TMP/gh-empty"
+            ge=(env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$WORK_TMP/gh-empty"
+                GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false
+                GIT_SSH_COMMAND=/usr/bin/false
+                GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=)
+        fi
+        (cd "$PROJECT_DIR" && ${ge[@]+"${ge[@]}"} bash -c "$BUILD_CMD") 2>&1
     else
         (cd "$PROJECT_DIR" && export JAVA_HOME="$JAVA_HOME_PATH" && ./gradlew "$BUILD_TASK") 2>&1
     fi
