@@ -611,17 +611,26 @@ is_env_build_failure() {
 
 # The one place a verification build runs: BUILD_CMD when the conf sets one,
 # otherwise the Gradle task.
+# Gated apps (APPROVED_BY): the fix session and the build that runs its code get no GitHub access.
+# Defence in depth, not a sandbox: no tokens (including the CI's APP_REPO_TOKEN), an empty gh config,
+# no git credential helper and no SSH. Set once WORK_TMP is known (gated_env_init).
+GATED_ENV=()
+gated_env_init() {
+    GATED_ENV=(env -u GH_TOKEN -u GITHUB_TOKEN -u APP_REPO_TOKEN GH_CONFIG_DIR="$WORK_TMP/gh-empty"
+               GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false
+               GIT_SSH_COMMAND=/usr/bin/false
+               GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=)
+    mkdir -p "$WORK_TMP/gh-empty"
+}
+
 run_build() {
     if [[ -n "$BUILD_CMD" ]]; then
         # Gated apps: the build runs code the fix session wrote (tests, configs), so it
         # gets the same no-GitHub environment as that session.
         local ge=()
         if [[ -n "$APPROVED_BY" ]]; then
-            mkdir -p "$WORK_TMP/gh-empty"
-            ge=(env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$WORK_TMP/gh-empty"
-                GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false
-                GIT_SSH_COMMAND=/usr/bin/false
-                GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=)
+            gated_env_init
+            ge=("${GATED_ENV[@]}")
         fi
         (cd "$PROJECT_DIR" && ${ge[@]+"${ge[@]}"} bash -c "$BUILD_CMD") 2>&1
     else
@@ -738,11 +747,8 @@ attempt_fix() {
         gate_args=(--disallowedTools "Bash(gh:*)" "Bash(git push:*)" "WebFetch" "WebSearch")
         # Defence in depth, not a sandbox: an empty gh config (no stored login), no git
         # credential helper and no SSH, so neither gh nor git can reach GitHub as the owner.
-        gate_env=(env -u GH_TOKEN -u GITHUB_TOKEN GH_CONFIG_DIR="$WORK_TMP/gh-empty"
-                  GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false SSH_ASKPASS=/usr/bin/false
-                  GIT_SSH_COMMAND=/usr/bin/false
-                  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=credential.helper GIT_CONFIG_VALUE_0=)
-        mkdir -p "$WORK_TMP/gh-empty"
+        gated_env_init
+        gate_env=("${GATED_ENV[@]}")
     fi
     if [[ "$CLAUDE_PROMPT_MODE" == "stdin" ]]; then
         echo "$prompt" | ${gate_env[@]+"${gate_env[@]}"} claude --dangerously-skip-permissions ${gate_args[@]+"${gate_args[@]}"} 2>&1 | tee -a "$task_log" "$claude_tmp"
