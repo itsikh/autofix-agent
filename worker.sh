@@ -14,7 +14,8 @@ set -euo pipefail
 #   Required: APP_SLUG, PROJECT_DIR, BUGS_REPO
 #   Optional: LOCK_SLUG, GIT_REMOTES, PROMPT_FILE, RELEASE_MODE,
 #             BUILD_TASK, MAX_RETRIES, CLAUDE_PROMPT_MODE, CUSTOM_SCRIPT,
-#             ALLOW_BUILD_INFRA_EDITS, MAIN_BRANCH, AUTOFIX_LABEL
+#             ALLOW_BUILD_INFRA_EDITS, MAIN_BRANCH, AUTOFIX_LABEL,
+#             BUILD_CMD, APPROVED_BY
 ###############################################################################
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
@@ -67,6 +68,16 @@ RELEASE_MODE="${RELEASE_MODE:-skill}"
 # Releases belong on the Mac, where the real keystore lives.
 [[ -n "${AUTOFIX_RELEASE_MODE:-}" ]] && RELEASE_MODE="$AUTOFIX_RELEASE_MODE"
 BUILD_TASK="${BUILD_TASK:-assembleDebug}"
+# Non-Gradle apps (e.g. a TypeScript browser extension): a shell command run in
+# PROJECT_DIR that must exit 0 for a fix to count. When set it replaces
+# `./gradlew $BUILD_TASK` everywhere, and the Gradle toolchain check is skipped.
+BUILD_CMD="${BUILD_CMD:-}"
+# Human approval gate. When set (comma-separated GitHub logins), an issue is only
+# worked on if its AUTOFIX_LABEL was added by one of these accounts AND the issue
+# title/body were not edited after that. For repos where untrusted writers (an
+# in-app reporter with an issues-write token) can open issues and add labels
+# themselves, the label alone proves nothing.
+APPROVED_BY="${APPROVED_BY:-}"
 # The branch to work on. `main` for every app except triviaapp, whose default
 # branch is `main-clean`. Hardcoding it meant that app could never run at all:
 # verify_git_state refused it before doing anything.
@@ -374,6 +385,10 @@ fetch_and_group_issues() {
         fi
     done
 
+    if [[ -n "$APPROVED_BY" ]]; then
+        filter_approved "$tmp_issues" || return 1
+    fi
+
     local count
     count=$(run_py "$tmp_issues" 'import json,sys
 with open(sys.argv[1]) as f: print(len(json.load(f)))')
@@ -406,6 +421,61 @@ for issue in standalone:
     tasks.append([issue])
 print(json.dumps(tasks))
 '
+}
+
+# Keep only issues whose AUTOFIX_LABEL was added by an APPROVED_BY account, with
+# no title/body edit after that approval. Rewrites the issues file in place.
+# Anything unverifiable (API error, missing data) drops the issue: fail closed.
+filter_approved() {
+    local issues_file="$1"
+    local owner="${BUGS_REPO%%/*}" name="${BUGS_REPO#*/}"
+    local nums n
+    nums=$(run_py "$issues_file" 'import json,sys
+print(" ".join(str(i["number"]) for i in json.load(open(sys.argv[1]))))')
+    : > "$WORK_TMP/approved.txt"
+    for n in $nums; do
+        # The newest `labeled` events (with actor) and the issue's last edit time.
+        # Unlabel/relabel cycles are covered: the LAST labeled event is the one
+        # that put the current label on.
+        if ! run_with_timeout gh api graphql -F owner="$owner" -F name="$name" -F n="$n" -f query='
+query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){issue(number:$n){
+  lastEditedAt
+  timelineItems(last:100,itemTypes:[LABELED_EVENT,RENAMED_TITLE_EVENT]){nodes{__typename
+    ... on LabeledEvent{createdAt label{name} actor{login}}
+    ... on RenamedTitleEvent{createdAt}}}}}}'             > "$WORK_TMP/approval_$n.json" 2>/dev/null; then
+            log "Approval check for #$n failed (GitHub API) — skipping it this run" >&2
+            continue
+        fi
+        if APPROVERS="$APPROVED_BY" LABEL="$AUTOFIX_LABEL" run_py "$WORK_TMP/approval_$n.json" '
+import json, os, sys
+d = json.load(open(sys.argv[1]))
+issue = (((d.get("data") or {}).get("repository") or {}).get("issue")) or {}
+approvers = {a.strip().lower() for a in os.environ["APPROVERS"].split(",") if a.strip()}
+nodes = [e for e in ((issue.get("timelineItems") or {}).get("nodes") or []) if e]
+events = [e for e in nodes if e.get("__typename") == "LabeledEvent"
+          and (e.get("label") or {}).get("name") == os.environ["LABEL"]]
+if not events:
+    sys.exit(1)
+last = max(events, key=lambda e: e["createdAt"])
+if ((last.get("actor") or {}).get("login") or "").lower() not in approvers:
+    sys.exit(1)
+# Any later body edit or retitle means the text Claude would read is not the
+# text that was approved.
+edits = [issue.get("lastEditedAt")] + [e.get("createdAt") for e in nodes
+                                       if e.get("__typename") == "RenamedTitleEvent"]
+sys.exit(1 if any(t and t > last["createdAt"] for t in edits) else 0)
+'; then
+            echo "$n" >> "$WORK_TMP/approved.txt"
+        else
+            log "#$n carries '$AUTOFIX_LABEL' but not from an approver (or was edited after approval) — skipped" >&2
+        fi
+    done
+    python3 -c '
+import json, sys
+ok = {int(x) for x in open(sys.argv[2]).read().split()}
+issues = [i for i in json.load(open(sys.argv[1])) if i["number"] in ok]
+json.dump(issues, open(sys.argv[1], "w"))
+' "$issues_file" "$WORK_TMP/approved.txt"
 }
 
 # ── Prompt Building ───────────────────────────────────────────────────────────
@@ -494,11 +564,25 @@ is_env_build_failure() {
     return 1
 }
 
+# The one place a verification build runs: BUILD_CMD when the conf sets one,
+# otherwise the Gradle task.
+run_build() {
+    if [[ -n "$BUILD_CMD" ]]; then
+        (cd "$PROJECT_DIR" && bash -c "$BUILD_CMD") 2>&1
+    else
+        (cd "$PROJECT_DIR" && export JAVA_HOME="$JAVA_HOME_PATH" && ./gradlew "$BUILD_TASK") 2>&1
+    fi
+}
+build_label() { if [[ -n "$BUILD_CMD" ]]; then echo "BUILD_CMD"; else echo "$BUILD_TASK"; fi; }
+
 # ~5 seconds, and it catches the whole class of failure above before a single
 # token is spent: a missing or unexecutable wrapper, a wrapper jar that is not
 # there, an unusable JDK, a corrupt Gradle distribution.
 check_build_env() {
     cd "$PROJECT_DIR"
+    # No Gradle here: the conf's BUILD_CMD is the build, and its first run says
+    # whether the toolchain works.
+    [[ -n "$BUILD_CMD" ]] && return 0
     if [[ ! -f ./gradlew ]]; then
         BUILD_ENV_ERROR="./gradlew is missing from $PROJECT_DIR"
         return 1
@@ -525,24 +609,23 @@ verify_baseline_build() {
     if [[ -z "${AUTOFIX_WORKSPACE:-}" ]]; then
         return 0
     fi
-    log "Verifying baseline build ($BUILD_TASK) before any fix..."
+    log "Verifying baseline build ($(build_label)) before any fix..."
     cd "$PROJECT_DIR"
-    export JAVA_HOME="$JAVA_HOME_PATH"
     local out exit_code=0
-    out=$(./gradlew "$BUILD_TASK" 2>&1) || exit_code=$?
+    out=$(run_build) || exit_code=$?
     if [[ $exit_code -eq 0 ]]; then
         log "Baseline build passed — a later build failure is attributable to the fix."
         return 0
     fi
     if is_env_build_failure "$out"; then
-        BUILD_ENV_ERROR="baseline $BUILD_TASK failed: $BUILD_ENV_ERROR"
+        BUILD_ENV_ERROR="baseline $(build_label) failed: $BUILD_ENV_ERROR"
     else
         # Deliberately NOT the compiler output. BUILD_ENV_ERROR is logged through
         # log_error, and ci/status-lines.sh echoes every ERROR: line into a job log
         # that is world-readable on this public repo — compile messages quote lines
         # of a private app's source. The detail goes to the withheld log instead.
         echo "$out" | tail -100 >> "$LOG_DIR/baseline_$(date +%Y%m%d_%H%M%S).log"
-        BUILD_ENV_ERROR="baseline $BUILD_TASK failed on untouched HEAD $(git rev-parse --short HEAD) — see the withheld run log for the compiler output"
+        BUILD_ENV_ERROR="baseline $(build_label) failed on untouched HEAD $(git rev-parse --short HEAD) — see the withheld run log for the compiler output"
     fi
     return 1
 }
@@ -630,11 +713,10 @@ attempt_fix() {
         log "Claude committed changes (HEAD moved to ${head_after:0:8}) — verifying build."
     fi
 
-    log "Verifying build ($BUILD_TASK)..."
-    export JAVA_HOME="$JAVA_HOME_PATH"
+    log "Verifying build ($(build_label))..."
     local build_exit=0
     local build_output
-    build_output=$(cd "$PROJECT_DIR" && ./gradlew "$BUILD_TASK" 2>&1) || build_exit=$?
+    build_output=$(run_build) || build_exit=$?
     echo "$build_output" >> "$task_log"
 
     if [[ $build_exit -ne 0 ]]; then
@@ -645,7 +727,7 @@ attempt_fix() {
             log_error "Build environment fault, not a bad fix: $BUILD_ENV_ERROR"
             return 3
         fi
-        log_error "Build verification failed ($BUILD_TASK)."
+        log_error "Build verification failed ($(build_label))."
         return 1
     fi
 
@@ -832,6 +914,12 @@ completed or one has failed, and then say which."
 
 # ── Release Trigger ───────────────────────────────────────────────────────────
 trigger_release() {
+    if [[ "$RELEASE_MODE" == "manual" ]]; then
+        # Releases for this app are made by a person (its docs/RELEASE.md); the
+        # fix is pushed and the issue closed, nothing is published here.
+        log "RELEASE_MODE=manual: fixes are pushed; release by hand per the app's release docs."
+        return
+    fi
     if [[ "$RELEASE_MODE" == "none" ]]; then
         # Not a benign skip. The point of the agent is ticket in, new version out;
         # a fix that is pushed but never published reaches no user. mylock #15 was
