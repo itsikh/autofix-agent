@@ -43,6 +43,7 @@ CLOUD — .github/workflows/autofix.yml (hourly)
    - Groups issues by `story:*` label
    - For each task: prompts Claude CLI to fix, verifies the build, commits, closes the issue on GitHub
    - After all tasks: triggers `/release`
+   - While Claude is out of quota, fixes run on Freebuff instead and `/release` waits — see [Freebuff fallback](#freebuff-fallback)
 
 3. **`wrapper.sh`** catches `agent.sh` failures, asks Claude to diagnose and fix the script itself, then retries (up to 2 meta-retries).
 
@@ -112,7 +113,11 @@ autofix-agent/
 ├── .github/workflows/
 │   └── autofix.yml     ← hourly cloud run (GitHub Actions)
 ├── ci/
-│   └── clone-app.sh    ← clones one app into the CI workspace
+│   ├── clone-app.sh    ← clones one app into the CI workspace
+│   └── freebuff-run.sh ← drives the Freebuff TUI through tmux (fallback)
+├── lib/
+│   └── ai-provider.sh  ← Claude ↔ Freebuff switch (limit detection, reset time)
+├── tests/              ← offline tests (bash tests/test-*.sh)
 ├── cloud/              ← paid-VM fallback (see docs/CLOUD.md)
 │   └── gradle.properties
 ├── setup-cloud.sh      ← provisions a GCE VM (fallback path)
@@ -186,6 +191,11 @@ Group related issues into a single Claude task by adding the same `story:<name>`
 | `AUTOFIX_ONLY_APP` | — | Restrict the run to a single app slug |
 | `AUTOFIX_WORKSPACE` | — | If set, `PROJECT_DIR` becomes `<workspace>/<slug>` (CI) |
 
+| `AUTOFIX_FALLBACK` | `freebuff` | `none` disables the Freebuff fallback |
+| `AUTOFIX_STATE_DIR` | `~/.autofix-agent-state` | Claude reset time + provider switch log |
+| `FREEBUFF_TIMEOUT_MIN` | `60` | Max minutes for one Freebuff fix session |
+| `FREEBUFF_CONFIG_DIR` | `~/.config/manicode` | Freebuff credentials dir (absolute); or set `CODEBUFF_API_KEY` |
+
 Override: `AUTOFIX_MAX_PARALLEL=5 ./agent.sh`
 
 Useful flags:
@@ -194,6 +204,24 @@ Useful flags:
 ./agent.sh --list-json     # print apps with unclaimed issues as JSON; run no workers
 ./agent.sh --max-parallel 5
 ```
+
+## Freebuff fallback
+
+When Claude reports a usage limit (weekly/session limit, `usage limit reached`,
+low credit, 429), the worker records the reset time, resets the tree, and reruns
+the same fix with [Freebuff](https://freebuff.com) — the free, ad-supported
+Codebuff agent, driven headlessly through tmux by `ci/freebuff-run.sh`. Claude is
+not called again until the reset time; then it is tried first, and a success
+switches back. Every switch is logged as an `AI-PROVIDER:` line. If Freebuff is
+unavailable as well, the issue is left untouched for the next run (no retry
+spent, no stuck label). `/release` is deferred while Claude is blocked.
+
+**Privacy:** Freebuff is ad-supported and some of its models may retain or train
+on prompts, so private app code is sent to it — only while Claude is out of
+quota, and with every credential but its own removed from its environment.
+Disable with `AUTOFIX_FALLBACK=none` (or, in CI, by not setting the Freebuff
+secret). Details, secrets and the switch-back: [docs/CLOUD.md](docs/CLOUD.md#freebuff-fallback).
+Tests: `bash tests/test-ai-fallback.sh`.
 
 ## Logs
 

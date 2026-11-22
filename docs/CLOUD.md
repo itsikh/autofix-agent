@@ -139,6 +139,8 @@ sensitive is committed to this repo.
 | `AUTOFIX_MAIL_TO` | no | Recipient for run digests. Unset means no email; runs are unaffected. |
 | `AUTOFIX_MAIL_USER` | no | SMTP username, e.g. your Gmail address. |
 | `AUTOFIX_MAIL_PASS` | no | SMTP password — a Gmail **app password**, never the account password. |
+| `FREEBUFF_CREDENTIALS` | no | Full contents of `~/.config/manicode/credentials.json` from a machine logged in to Freebuff. Enables the [Freebuff fallback](#freebuff-fallback). |
+| `CODEBUFF_API_KEY` | no | Alternative to the above: a Codebuff API key for Freebuff. |
 
 \* Set one or the other. `CLAUDE_CODE_OAUTH_TOKEN` uses the subscription you
 already pay for; `ANTHROPIC_API_KEY` adds metered API charges.
@@ -169,6 +171,11 @@ exists for — a filed bug becoming an installable version without a human.
 - **SSH key** is written under `umask 077`, `chmod 600`, with `bitbucket.org`
   pinned via `ssh-keyscan`.
 
+- **Freebuff credentials** are written under `umask 077` to
+  `$RUNNER_TEMP/freebuff-cfg/` and deleted by an `always()` step;
+  `CODEBUFF_API_KEY` reaches only the run step. Freebuff itself gets none of
+  the other secrets (see below).
+
 ### ⚠️ Public logs
 
 This repo is public, so **Actions logs are world-readable** — and worker output
@@ -178,6 +185,67 @@ status lines.
 
 Run with `verbose_logs: true` (workflow_dispatch) to print everything. Only do
 that when debugging an app whose contents you are comfortable publishing.
+
+## Freebuff fallback
+
+When Claude is out of quota (`You've hit your weekly limit · resets 5pm (UTC)`,
+`Claude AI usage limit reached|<epoch>`, `Credit balance is too low`, API 429 /
+`rate_limit_error` / `overloaded_error`), a run used to fail every attempt in
+seconds, burn the retries and label the issue `autofix-stuck` for something no
+fix could change. Now fixes fall back to [Freebuff](https://freebuff.com), the
+free ad-supported Codebuff agent, until Claude's limit resets.
+
+**How it works** (`lib/ai-provider.sh`, `ci/freebuff-run.sh`):
+
+1. Every fix session goes through `run_fix_agent`. Claude runs exactly as
+   before. If its output ends in a limit notice, the reset time is parsed
+   (next occurrence, +1 minute; unparseable → one hour) and stored in
+   `~/.autofix-agent-state/claude-blocked-until`.
+2. The tree is reset to the task's starting commit and the same prompt goes to
+   Freebuff. Freebuff is a TUI only, so `ci/freebuff-run.sh` drives it in a
+   private tmux server: waits for the input prompt, pastes the task plus rules
+   (stay in the repo, no push, no `gh`, write a summary file outside the repo
+   ending in `FREEBUFF-DONE`), presses Enter on "Take over" / "session
+   released", sends "continue" when a free session ends, and stops after
+   `FREEBUFF_TIMEOUT_MIN` (60). The result file carries `ALREADY_FIXED:` /
+   `BUILD_ENV_BROKEN:` / `FIX_SUMMARY` exactly like Claude's output, and the fix
+   is built and verified the same way.
+3. Until the stored time passes, Claude is not called at all. After it, Claude
+   is tried first again; a successful run deletes the state ("back to Claude").
+4. Each switch is an `AI-PROVIDER:` status line in the public job log and in
+   `~/.autofix-agent-state/provider-switch.log`, e.g.
+   `AI-PROVIDER: Claude limit hit (You've hit your weekly limit · resets 5pm (UTC)); Claude blocked until 2026-11-23T17:01Z; using Freebuff`.
+5. If Freebuff is unavailable too (no secret, not logged in, free allowance used
+   up, servers unreachable, nothing happened before the timeout), the app's run
+   stops with `ERROR: AI unavailable: … — will retry next run`. The issue stays
+   open and labelled, with no retry spent, no `autofix-stuck` label and no
+   comment.
+6. `/release` stays Claude-only: while Claude is blocked it is skipped
+   ("release deferred"), not failed, and `drift-scan` holds `drift-release`
+   with a notice. Once Claude is back, the drift backstop publishes it.
+
+The state survives the ephemeral runners through `actions/cache` (prefix
+`autofix-ai-state-`, newest wins). It holds a timestamp and the switch log only.
+Without it nothing breaks: Claude is tried, the limit is recognised within
+seconds and the switch happens anyway.
+
+**Secrets:** `FREEBUFF_CREDENTIALS` (log in once with `freebuff` on any machine,
+then paste the whole of `~/.config/manicode/credentials.json`) or
+`CODEBUFF_API_KEY`. Freebuff allows one session per account across CLI and
+Desktop, and the runner takes it over — use an account you are not using
+interactively at the same time.
+
+**Privacy — read this before setting the secret.** Freebuff is ad-supported,
+and some of the models it routes to may retain or train on prompts. With the
+fallback on, *private app source code and issue text are sent to it* — but only
+while Claude is out of quota. It runs with a scrubbed environment: no GitHub,
+Bitbucket, Anthropic, signing or mail credentials and no SSH agent; repo
+`.agents`/`mcp.json` files are not trusted. For gated apps (`APPROVED_BY`) it
+also gets the same no-GitHub environment as the Claude session.
+
+**Turning it off:** don't set either secret (the workflow then sets
+`AUTOFIX_FALLBACK=none`), or set `AUTOFIX_FALLBACK=none` on any host. A Claude
+limit then pauses fixing until the reset, with no harm to the issues.
 
 ---
 
