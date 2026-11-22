@@ -140,6 +140,10 @@ STUCK_LABEL="autofix-stuck"
 WORK_TMP=""
 BUILD_ENV_ERROR=""
 RELEASE_FAILED=false
+# Claude was out of quota at release time: not a failure, ci/release-drift.sh and
+# the drift-release job publish the fix once Claude is back.
+RELEASE_DEFERRED=false
+AI_UNAVAILABLE=""
 
 # Paths git must not stage as part of a fix. When mylock's wrapper jar was missing
 # from the repo, Claude repaired the wrapper on the runner to get a build at all,
@@ -154,6 +158,10 @@ BUILD_INFRA_PATHSPECS=(
     ':(exclude)local.properties'
     ':(exclude)keystore.properties'
 )
+
+# Claude / Freebuff selection: run_fix_agent, claude_available.
+# shellcheck source=lib/ai-provider.sh
+source "$AGENT_DIR/lib/ai-provider.sh"
 
 if [[ ! -f "$PROMPT_TEMPLATE" ]]; then
     echo "ERROR: Prompt template not found: $PROMPT_TEMPLATE" >&2
@@ -727,7 +735,8 @@ issue_is_stuck() {
 
 # ── Fix Execution ─────────────────────────────────────────────────────────────
 # Returns: 0 = fix applied & build passed, 1 = failure (attributable to the fix),
-#          2 = already fixed, 3 = build environment is broken (not the fix's fault)
+#          2 = already fixed, 3 = build environment is broken (not the fix's fault),
+#          4 = no AI available (Claude out of quota and the Freebuff fallback unusable)
 attempt_fix() {
     local prompt="$1"
     local task_log="$2"
@@ -735,38 +744,39 @@ attempt_fix() {
     local head_before
     head_before=$(git rev-parse HEAD 2>/dev/null || echo "")
 
-    log "Invoking Claude CLI..."
     local claude_exit=0
     local claude_tmp
     claude_tmp=$(mktemp)
 
     # Gated apps: the fix session gets no GitHub access, so text in an issue can't
     # make it label, comment on or edit issues (which would act as the approver).
-    local gate_args=() gate_env=()
+    AI_CLAUDE_ARGS=() AI_AGENT_ENV=()
     if [[ -n "$APPROVED_BY" ]]; then
-        gate_args=(--disallowedTools "Bash(gh:*)" "Bash(git push:*)" "WebFetch" "WebSearch")
+        AI_CLAUDE_ARGS=(--disallowedTools "Bash(gh:*)" "Bash(git push:*)" "WebFetch" "WebSearch")
         # Defence in depth, not a sandbox: an empty gh config (no stored login), no git
         # credential helper and no SSH, so neither gh nor git can reach GitHub as the owner.
+        # The same prefix wraps the Freebuff fallback (lib/ai-provider.sh).
         gated_env_init
-        gate_env=("${GATED_ENV[@]}")
+        AI_AGENT_ENV=("${GATED_ENV[@]}")
     fi
-    if [[ "$CLAUDE_PROMPT_MODE" == "stdin" ]]; then
-        echo "$prompt" | ${gate_env[@]+"${gate_env[@]}"} claude --dangerously-skip-permissions ${gate_args[@]+"${gate_args[@]}"} 2>&1 | tee -a "$task_log" "$claude_tmp"
-    else
-        ${gate_env[@]+"${gate_env[@]}"} claude --dangerously-skip-permissions ${gate_args[@]+"${gate_args[@]}"} -p "$prompt" 2>&1 | tee -a "$task_log" "$claude_tmp"
-    fi
-    claude_exit=${PIPESTATUS[0]}
-    local claude_output
+    # Claude, or Freebuff while Claude is out of quota (lib/ai-provider.sh).
+    run_fix_agent "$prompt" "$task_log" "$claude_tmp" "$CLAUDE_PROMPT_MODE" || claude_exit=$?
+    local claude_output agent="${AI_AGENT_USED:-Claude}"
     claude_output=$(cat "$claude_tmp")
     rm -f "$claude_tmp"
 
+    if [[ $claude_exit -eq 4 ]]; then
+        # Not the fix's fault and not the issue's: no AI could run at all.
+        AI_UNAVAILABLE="Claude blocked until ${AI_BLOCKED_UNTIL:-?} and Freebuff unavailable (${AI_UNAVAILABLE_REASON:-unknown})"
+        return 4
+    fi
     if [[ $claude_exit -ne 0 ]]; then
-        log_error "Claude CLI exited with code $claude_exit"
+        log_error "$agent exited with code $claude_exit"
         return 1
     fi
 
     if echo "$claude_output" | grep -q "ALREADY_FIXED:"; then
-        log "Claude determined issue is already fixed."
+        log "$agent determined issue is already fixed."
         return 2
     fi
 
@@ -775,7 +785,7 @@ attempt_fix() {
     # fix ends up carrying wrapper churn it has no business touching.
     if echo "$claude_output" | grep -q "BUILD_ENV_BROKEN:"; then
         BUILD_ENV_ERROR="$(echo "$claude_output" | grep -m1 "BUILD_ENV_BROKEN:" | sed 's/.*BUILD_ENV_BROKEN: *//' | cut -c1-300)"
-        log_error "Claude reports the build environment is broken: $BUILD_ENV_ERROR"
+        log_error "$agent reports the build environment is broken: $BUILD_ENV_ERROR"
         return 3
     fi
 
@@ -785,7 +795,7 @@ attempt_fix() {
     [[ -n "$head_before" && "$head_before" != "$head_after" ]] && claude_committed=true
 
     if [[ "$claude_committed" == "false" ]] && git diff --quiet && git diff --cached --quiet; then
-        log_error "Claude ran but no files were modified or committed."
+        log_error "$agent ran but no files were modified or committed."
         return 1
     fi
 
@@ -795,7 +805,7 @@ attempt_fix() {
     # anything, so a broken fix would be published and announced as resolved.
     # An extra build is cheap next to a green issue pointing at a broken commit.
     if [[ "$claude_committed" == "true" ]]; then
-        log "Claude committed changes (HEAD moved to ${head_after:0:8}) — verifying build."
+        log "$agent committed changes (HEAD moved to ${head_after:0:8}) — verifying build."
     fi
 
     if ! protected_untouched "$head_before"; then return 1; fi
@@ -869,7 +879,8 @@ attempt_tail() {
     tail -c "+$((offset + 1))" "$file" 2>/dev/null | tail -50
 }
 
-# Returns: 0 = fixed (or verified already fixed), 1 = failed, 3 = environment fault
+# Returns: 0 = fixed (or verified already fixed), 1 = failed, 3 = environment fault,
+#          4 = no AI available
 try_fix_task() {
     local task_file="$1"
     local task_log="$2"
@@ -969,6 +980,15 @@ for i in issues: print(i["number"])')
             log_error "Aborting task: build environment is broken — $BUILD_ENV_ERROR"
             log_error "No retry consumed, no failure comment posted: this is not a bad fix."
             return 3
+
+        elif [[ $fix_result -eq 4 ]]; then
+            # Like an environment fault, one step further out: no agent ran at all.
+            # Burning retries, labelling the issue stuck or commenting would each
+            # blame an issue nobody has looked at. It stays open and labelled for
+            # the next run.
+            reset_to_task_head "$task_head"
+            log_error "AI unavailable: $AI_UNAVAILABLE — will retry next run"
+            return 4
         fi
 
         retry_context=$(attempt_tail "$task_log" "$attempt_offset")
@@ -1047,12 +1067,29 @@ trigger_release() {
     local before_tag after_tag
     before_tag=$(run_with_timeout gh release view --repo "$BUGS_REPO" --json tagName -q .tagName 2>/dev/null || echo "")
 
+    # /release stays Claude-only (it signs and publishes). While Claude is out of
+    # quota the fix is pushed and the release waits: drift-release publishes it.
+    if ! claude_available; then
+        ai_log "release deferred until Claude is back (blocked until $AI_BLOCKED_UNTIL); drift-release will publish it"
+        RELEASE_DEFERRED=true
+        return
+    fi
     log "Triggering release via Claude CLI (/release)..."
     cd "$PROJECT_DIR"
-    local rel_exit=0
-    claude --dangerously-skip-permissions \
+    local rel_exit=0 rel_out reason
+    rel_out=$(mktemp)
+    "$AUTOFIX_CLAUDE_BIN" --dangerously-skip-permissions \
         --append-system-prompt "$RELEASE_SESSION_RULE" \
-        -p "/release" </dev/null 2>&1 || rel_exit=$?
+        -p "/release" </dev/null > "$rel_out" 2>&1 || rel_exit=$?
+    cat "$rel_out"
+    if [[ $rel_exit -ne 0 ]] && reason=$(claude_limit_reason "$(tail -c 3000 "$rel_out")"); then
+        rm -f "$rel_out"
+        record_claude_limit "$reason"
+        ai_log "Claude limit hit ($reason); Claude blocked until $AI_BLOCKED_UNTIL; release deferred, drift-release will publish it"
+        RELEASE_DEFERRED=true
+        return
+    fi
+    rm -f "$rel_out"
     if [[ $rel_exit -ne 0 ]]; then
         log_error "Release FAILED (claude exit $rel_exit). Fixes are pushed but unreleased."
         RELEASE_FAILED=true
@@ -1107,6 +1144,7 @@ main() {
     local any_fixed=false
     local any_failed=false
     local env_failed=false
+    local ai_unavailable=false
     local all_fixed_issues=()
     local round=1
 
@@ -1174,6 +1212,13 @@ print(", ".join("#"+str(i["number"]) for i in issues))')
 with open(sys.argv[1]) as f: issues=json.load(f)
 for i in issues: print(i["number"])')
                 rm -f "$task_log.diff_summary" "$task_log.diff_detail" "$task_log.fix_summary" "$task_log.attempt"
+            elif [[ $task_result -eq 4 ]]; then
+                # No AI for this app this run; every other task would get the same
+                # answer. The issue keeps its autofix label: next run picks it up.
+                any_failed=true
+                ai_unavailable=true
+                unlabel_task_active "$task_file"
+                break
             elif [[ $task_result -eq 3 ]]; then
                 # The environment, not this task. Every remaining task would hit the
                 # same wall, so stop rather than burn the rest of the budget on it.
@@ -1189,6 +1234,11 @@ for i in issues: print(i["number"])')
             task_index=$((task_index + 1))
         done
 
+        # Not a break here: issues fixed earlier in this round are already closed,
+        # so their commits must still be pushed below before stopping.
+        if [[ "$ai_unavailable" == "true" ]]; then
+            log_error "Stopping: no AI agent is available — remaining issues wait for the next run."
+        fi
         if [[ "$env_failed" == "true" ]]; then
             log_error "Stopping: the build environment is broken, not the fixes."
             break
@@ -1214,6 +1264,7 @@ for i in issues: print(i["number"])')
             break
         fi
 
+        [[ "$ai_unavailable" == "true" ]] && break
         round=$((round + 1))
         sleep 5
     done
