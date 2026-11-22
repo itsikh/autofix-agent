@@ -22,6 +22,15 @@
 #   AUTOFIX_NOW          epoch seconds to use as "now" (tests)
 #   AUTOFIX_CLAUDE_BIN   claude binary (default: claude)
 #   AUTOFIX_FREEBUFF_RUN Freebuff driver (default: $AGENT_DIR/ci/freebuff-run.sh)
+#   AUTOFIX_FREEBUFF_BUDGET_MIN  total Freebuff wall-clock per job (default 90), so
+#                        the CI job timeout (150 min) is never reached. Each task
+#                        (AI_TASK_KEY, set by worker.sh) also gets ONE Freebuff
+#                        attempt only. Either limit reached -> return 4 (no AI).
+#   AUTOFIX_FB_LEDGER    where that budget is tracked (default $WORK_TMP/…, tests)
+#   AUTOFIX_CODEBUFF_API_KEY (or CODEBUFF_API_KEY) Freebuff's API key. Taken out of
+#                        the environment here and handed to the driver alone, so
+#                        builds (gradle, BUILD_CMD: the app's own code) and Claude
+#                        never see it.
 ###############################################################################
 
 AI_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,6 +41,11 @@ AUTOFIX_CLAUDE_BIN="${AUTOFIX_CLAUDE_BIN:-claude}"
 AUTOFIX_FREEBUFF_RUN="${AUTOFIX_FREEBUFF_RUN:-$AGENT_DIR/ci/freebuff-run.sh}"
 AI_BLOCKED_FILE="$AUTOFIX_STATE_DIR/claude-blocked-until"
 AI_SWITCH_LOG="$AUTOFIX_STATE_DIR/provider-switch.log"
+AI_SWITCH_LOG_KEEP=200
+AUTOFIX_FREEBUFF_BUDGET_MIN="${AUTOFIX_FREEBUFF_BUDGET_MIN:-90}"
+# Not exported: a plain shell variable is invisible to every child process.
+AI_CODEBUFF_KEY="${AUTOFIX_CODEBUFF_API_KEY:-${CODEBUFF_API_KEY:-}}"
+unset AUTOFIX_CODEBUFF_API_KEY CODEBUFF_API_KEY
 
 # Set by the caller (worker.sh attempt_fix) for gated apps: extra claude flags,
 # and an `env ...` prefix that keeps the agent away from GitHub.
@@ -41,6 +55,11 @@ AI_AGENT_ENV=()
 AI_AGENT_USED=""
 AI_UNAVAILABLE_REASON=""
 AI_BLOCKED_UNTIL=""
+# job = no AI for anything this run (stop); task = only this task is out of
+# Freebuff attempts (move on to the next one).
+AI_NO_AI_SCOPE="job"
+# Identifies the task for the one-Freebuff-attempt-per-task rule (worker.sh).
+AI_TASK_KEY="${AI_TASK_KEY:-}"
 
 ai_now() { echo "${AUTOFIX_NOW:-$(date +%s)}"; }
 
@@ -52,53 +71,77 @@ ai_log() {
     mkdir -p "$AUTOFIX_STATE_DIR" 2>/dev/null || return 0
     printf '%s\t%s\t%s\n' "$(date -u -d "@$(ai_now)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "${APP_SLUG:--}" "$*" >> "$AI_SWITCH_LOG" 2>/dev/null || true
+    # It travels in the Actions cache: keep it bounded.
+    if [[ $(wc -l < "$AI_SWITCH_LOG" 2>/dev/null || echo 0) -gt $((AI_SWITCH_LOG_KEEP + 50)) ]]; then
+        tail -n "$AI_SWITCH_LOG_KEEP" "$AI_SWITCH_LOG" > "$AI_SWITCH_LOG.tmp.$$" \
+            && mv -f "$AI_SWITCH_LOG.tmp.$$" "$AI_SWITCH_LOG"
+    fi
 }
 
-# claude_limit_reason <output> — prints the limit text and returns 0 when the
-# output is a quota / usage-limit / credit / rate-limit message. Only the last
-# 3000 bytes count and only specific phrases match, so a fix whose output merely
-# talks about "limit" (a rate limiter in the app, say) never triggers a switch.
-# What is printed is the matched phrase plus the rest of its line, capped and
-# reduced to printable characters: it ends up in a public status line.
+# claude_limit_reason <output> — returns 0 and prints a CANONICAL reason when the
+# output is a quota / usage-limit / credit / API rate-limit notice. Only the last
+# 3000 bytes count and only notice-shaped phrases match: 429 / rate_limit_error /
+# overloaded_error only after "API Error:", "<kind> limit reached" only with the
+# reset right after it. What is printed is never model text: a fixed label plus
+# the reset time rebuilt from a whitelist of characters, e.g.
+#   weekly limit · resets 5pm (UTC)        API rate limit (429)
+# It ends up in a public status line, and parse_reset_time reads it back.
+# The caller decides WHEN to ask (run_fix_agent: failed runs and tiny no-op ones).
 claude_limit_reason() {
     printf '%s' "$1" | python3 -I -c '
-import re, sys
+import datetime as dt, re, sys
 tail = sys.stdin.buffer.read()[-3000:].decode("utf-8", "replace")
-pat = re.compile(
-    r"(you.?ve hit your\b[^\n]{0,40}?\blimit"
-    # Real notices carry the reset right after ("Weekly limit reached ∙ resets 5pm"),
-    # which keeps a summary saying "the daily limit reached state..." out.
-    r"|\b(?:usage|5-hour|five-hour|weekly|session|daily|opus|sonnet)\s+limit\s+(?:reached|exceeded)"
-    r"[^\n\w]{0,5}(?:[·∙|]|resets?\b|$)"
-    r"|claude ai usage limit reached"
-    r"|limit will reset at"
-    r"|you.?re out of (?:extra )?usage"
-    r"|credit balance is too low"
-    r"|\brate_limit_error\b"
-    r"|\boverloaded_error\b"
-    r"|API Error:\s*(?:429|529)\b"
-    r"|\b429 Too Many Requests\b)", re.I)
-# The first match on the last line that has one: the notice itself, not the
-# JSON error type trailing behind it.
+KIND = r"(5-hour|five-hour|weekly|session|daily|opus|sonnet|usage)"
+RULES = [
+    (re.compile(r"you.?ve hit your\s+(?:" + KIND + r"\s+)?limit\b", re.I), None),
+    (re.compile(r"\b" + KIND + r"\s+limit\s+(?:reached|exceeded)\s*(?:[·∙•]\s*resets?\b|\|\s*\d{9,11}\b"
+                r"|[.,;]?\s*(?:your\s+limit\s+will\s+)?resets?\b)", re.I), None),
+    (re.compile(r"claude ai usage limit reached", re.I), "usage limit"),
+    (re.compile(r"\byour limit will reset at\b", re.I), "usage limit"),
+    (re.compile(r"you.?re out of (?:extra )?usage", re.I), "out of usage"),
+    (re.compile(r"credit balance is too low", re.I), "credit balance too low"),
+    (re.compile(r"API Error:\s*(?:429\b|[^\n]{0,120}\brate_limit_error\b)", re.I), "API rate limit (429)"),
+    (re.compile(r"API Error:\s*(?:529\b|[^\n]{0,120}\boverloaded_error\b)", re.I), "API overloaded (529)"),
+]
+hit = None
 for line in reversed(tail.splitlines()):
-    m = pat.search(line)
-    if m:
+    for rx, label in RULES:
+        m = rx.search(line)
+        if m:
+            hit = (line, label or ((m.group(1) or "usage").lower() + " limit"))
+            break
+    if hit:
         break
-else:
+if not hit:
     sys.exit(1)
-text = line[m.start():][:160]
-print("".join(c for c in text if c.isprintable()).strip())
+line, label = hit
+reset = ""
+m = re.search(r"\|\s*(\d{9,11})\b", line)
+RS = r"\bresets?\s+(?:at\s+|on\s+)?([A-Za-z0-9 ,:]{1,30}?)\s*"
+# With a "(zone)" the reset ends there; without one it must end the notice.
+r = (re.search(RS + r"(\([A-Za-z_/+\-0-9]{1,40}\))", line, re.I)
+     or re.search(RS + r"()(?:$|[.·∙•|])", line, re.I))
+t = re.search(r"try again in\s+(\d{1,4})\s*(seconds?|secs?|minutes?|mins?|hours?|hrs?)\b", line, re.I)
+if m:
+    reset = "resets " + dt.datetime.fromtimestamp(int(m.group(1)), dt.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+elif r:
+    reset = ("resets " + r.group(1).strip() + (" " + r.group(2) if r.group(2) else "")).strip()
+elif t:
+    reset = "try again in %s %s" % (t.group(1), t.group(2).lower())
+out = label + (" · " + reset if reset else "")
+out = re.sub(r"[^A-Za-z0-9 ,:()/_+\-·.]", "", out)[:100].strip()
+print(out)
 '
 }
 
-# parse_reset_time <text> — the ISO-8601 UTC minute at which Claude is usable
-# again: the next occurrence of the stated reset time after now, plus one minute
-# of slack. Unparseable -> now + 1 hour (Claude is simply tried again then).
+# parse_reset_time <text> [fallback_min] — the ISO-8601 UTC minute at which
+# Claude is usable again: the next occurrence of the stated reset time after now,
+# plus one minute of slack. Unparseable -> now + fallback_min (default 60).
 parse_reset_time() {
-    python3 -I - "$1" "$(ai_now)" <<'PY'
+    python3 -I - "$1" "$(ai_now)" "${2:-60}" <<'PY'
 import datetime as dt, re, sys
 from zoneinfo import ZoneInfo
-text, now_ts = sys.argv[1], int(sys.argv[2])
+text, now_ts, fallback = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 now = dt.datetime.fromtimestamp(now_ts, dt.timezone.utc)
 MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
@@ -111,6 +154,10 @@ def out(t):
     sys.exit(0)
 
 def parse():
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})Z", text)     # canonical "resets <ISO>"
+    if m:
+        t = dt.datetime(*map(int, m.groups()), tzinfo=dt.timezone.utc)
+        return t if now < t < now + dt.timedelta(days=8) else None
     m = re.search(r"\|(\d{9,11})\b", text)               # "Claude AI usage limit reached|<epoch>"
     if m:
         t = dt.datetime.fromtimestamp(int(m.group(1)), dt.timezone.utc)
@@ -165,7 +212,7 @@ def parse():
     return cand
 
 t = parse()
-out(t if t is not None and t > now else now + dt.timedelta(hours=1) - dt.timedelta(minutes=1))
+out(t if t is not None and t > now else now + dt.timedelta(minutes=fallback - 1))
 PY
 }
 
@@ -191,9 +238,12 @@ claude_available() {
 
 # record_claude_limit <reason> — store the reset time; keep a later one already
 # recorded (another app's run in the same state dir may have seen a longer limit).
+# A 429/529 without a stated reset is usually brief: retry Claude in 15 minutes
+# rather than sending the code to a third party for an hour.
 record_claude_limit() {
-    local reason="$1" until cur cur_ep new_ep
-    until=$(parse_reset_time "$reason")
+    local reason="$1" until cur cur_ep new_ep fallback=60
+    [[ "$reason" == *"(429)"* || "$reason" == *"(529)"* ]] && fallback=15
+    until=$(parse_reset_time "$reason" "$fallback")
     cur=$(ai_blocked_until)
     if [[ -n "$cur" ]]; then
         cur_ep=$(ai_iso_to_epoch "$cur" || echo 0); new_ep=$(ai_iso_to_epoch "$until" || echo 0)
@@ -232,17 +282,43 @@ _ai_run_freebuff() {
         AI_UNAVAILABLE_REASON="Freebuff driver not found"
         return 4
     fi
+    # The budget: one attempt per task, and a wall-clock total per job that keeps
+    # the job inside its timeout. Wall clock, not just the driver's own deadline:
+    # a run may spend minutes waiting in line.
+    local ledger="${AUTOFIX_FB_LEDGER:-${WORK_TMP:-${TMPDIR:-/tmp}}/autofix-fb-ledger.$$}"
+    local budget=$((AUTOFIX_FREEBUFF_BUDGET_MIN * 60)) used remaining tmo
+    if [[ -n "$AI_TASK_KEY" ]] && cut -f1 "$ledger" 2>/dev/null | grep -qxF -- "$AI_TASK_KEY"; then
+        AI_UNAVAILABLE_REASON="Freebuff already had its one attempt at this task this run"
+        AI_NO_AI_SCOPE="task"
+        return 4
+    fi
+    used=$(awk -F'\t' '{s += $2} END {print s + 0}' "$ledger" 2>/dev/null || echo 0)
+    remaining=$((budget - used))
+    if [[ $remaining -lt 120 ]]; then
+        AI_UNAVAILABLE_REASON="Freebuff budget for this run used up (${AUTOFIX_FREEBUFF_BUDGET_MIN} min, AUTOFIX_FREEBUFF_BUDGET_MIN)"
+        return 4
+    fi
+    tmo="${FREEBUFF_TIMEOUT_SEC:-$(( ${FREEBUFF_TIMEOUT_MIN:-60} * 60 ))}"
+    [[ $tmo -gt $remaining ]] && tmo=$remaining
+
     AI_AGENT_USED="Freebuff"
     # The prompt and the result live outside the repo: a result file inside the
     # tree would be committed by `git add -A` as part of the fix.
-    local d rc=0
+    local d rc=0 t_start=$SECONDS line
     d=$(mktemp -d "${TMPDIR:-/tmp}/autofix-fb.XXXXXX")
     chmod 700 "$d"
     printf '%s\n' "$prompt" > "$d/prompt.txt"
+    chmod 644 "$d/prompt.txt"
     if declare -F log >/dev/null; then log "Invoking Freebuff..."; fi
-    FREEBUFF_PANE_LOG="${task_log}.freebuff-pane" \
+    FREEBUFF_PANE_LOG="${task_log}.freebuff-pane" FREEBUFF_TIMEOUT_SEC="$tmo" \
+        AUTOFIX_CODEBUFF_API_KEY="$AI_CODEBUFF_KEY" \
         ${AI_AGENT_ENV[@]+"${AI_AGENT_ENV[@]}"} "$AUTOFIX_FREEBUFF_RUN" "$PWD" "$d/prompt.txt" "$d/result.txt" \
         >> "$task_log" 2>&1 || rc=$?
+    printf '%s\t%s\n' "${AI_TASK_KEY:--}" "$((SECONDS - t_start))" >> "$ledger"
+    # The driver's public notices (fixed strings, no content), e.g. a credentials refresh.
+    while IFS= read -r line; do
+        ai_log "$(printf '%s' "$line" | tr -cd '[:alnum:] ,.;:()/_+-' | cut -c1-200)"
+    done < <(cat "$d/result.txt.notice" 2>/dev/null)
     if [[ -f "$d/result.txt" ]]; then
         cat "$d/result.txt" > "$out_file"
         # The task log is where FIX_SUMMARY is extracted from, as with Claude's output.
@@ -267,7 +343,12 @@ _ai_run_freebuff() {
 # ALREADY_FIXED: / BUILD_ENV_BROKEN: scanning works for both.
 run_fix_agent() {
     local prompt="$1" task_log="$2" out_file="$3" mode="${4:-${CLAUDE_PROMPT_MODE:-arg}}"
-    AI_AGENT_USED="" AI_UNAVAILABLE_REASON="" AI_BLOCKED_UNTIL=""
+    AI_AGENT_USED="" AI_UNAVAILABLE_REASON="" AI_BLOCKED_UNTIL="" AI_NO_AI_SCOPE="job"
+# job = no AI for anything this run (stop); task = only this task is out of
+# Freebuff attempts (move on to the next one).
+AI_NO_AI_SCOPE="job"
+# Identifies the task for the one-Freebuff-attempt-per-task rule (worker.sh).
+AI_TASK_KEY="${AI_TASK_KEY:-}"
     : > "$out_file"
 
     local stale=""
@@ -285,12 +366,21 @@ run_fix_agent() {
     if declare -F log >/dev/null; then log "Invoking Claude CLI..."; fi
     _ai_run_claude "$prompt" "$task_log" "$out_file" "$mode" || rc=$?
 
-    # A limit is believed when the run failed, or when its whole output is short
-    # (the limit notice IS the output): a long successful session that discusses
-    # usage limits is not one.
+    # A limit is only looked for when the run failed, or when it was a no-op whose
+    # whole output is a short notice: tiny, no FIX_SUMMARY, HEAD and tree
+    # untouched. A successful fix whose summary says "429" or "daily limit" is
+    # a fix, never a switch.
+    local look=false
     out_size=$(wc -c < "$out_file")
-    if { [[ $rc -ne 0 ]] || [[ $out_size -le 3000 ]]; } \
-        && reason=$(claude_limit_reason "$(tail -c 3000 "$out_file")"); then
+    if [[ $rc -ne 0 ]]; then
+        look=true
+    elif [[ $out_size -lt 400 && $(grep -c . "$out_file") -le 3 ]] \
+        && ! grep -q FIX_SUMMARY_START "$out_file" \
+        && [[ "$(git rev-parse HEAD 2>/dev/null || echo "")" == "$head_before" ]] \
+        && [[ -z "$(git status --porcelain -- . ':(exclude).autofix-logs' 2>/dev/null)" ]]; then
+        look=true
+    fi
+    if [[ "$look" == "true" ]] && reason=$(claude_limit_reason "$(tail -c 3000 "$out_file")"); then
         record_claude_limit "$reason"
         ai_log "Claude limit hit ($reason); Claude blocked until $AI_BLOCKED_UNTIL; using Freebuff"
         # Whatever Claude got done before the limit is unverified: the fallback starts
@@ -306,7 +396,9 @@ run_fix_agent() {
         return $?
     fi
 
-    if [[ -n "$stale" && $rc -eq 0 ]]; then
+    # Claude answered without a limit notice: the old block is over, whatever
+    # became of the fix itself.
+    if [[ -n "$stale" ]]; then
         rm -f "$AI_BLOCKED_FILE"
         ai_log "Claude reset passed; back to Claude"
     fi
