@@ -66,7 +66,10 @@ import re, sys
 tail = sys.stdin.buffer.read()[-3000:].decode("utf-8", "replace")
 pat = re.compile(
     r"(you.?ve hit your\b[^\n]{0,40}?\blimit"
+    # Real notices carry the reset right after ("Weekly limit reached ∙ resets 5pm"),
+    # which keeps a summary saying "the daily limit reached state..." out.
     r"|\b(?:usage|5-hour|five-hour|weekly|session|daily|opus|sonnet)\s+limit\s+(?:reached|exceeded)"
+    r"[^\n\w]{0,5}(?:[·∙|]|resets?\b|$)"
     r"|claude ai usage limit reached"
     r"|limit will reset at"
     r"|you.?re out of (?:extra )?usage"

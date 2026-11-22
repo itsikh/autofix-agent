@@ -145,13 +145,12 @@ EOF
 "${T[@]}" load-buffer -b task "$WORK/prompt"
 "${T[@]}" paste-buffer -p -d -b task -t "$S"
 sleep 3
+# Counted over the whole history, so a notice is acted on once per new
+# appearance. The baseline is taken before Enter: text that arrived with the
+# pasted prompt (issue text can say anything) is not an event.
+n_ended=$(count 'free session ended'); n_takeover=$(count 'Take over'); n_released=$(count 'was released')
 "${T[@]}" send-keys -t "$S" Enter
 sleep 3
-
-# Counted over the whole history, so a notice is acted on once per new
-# appearance — and text that arrived with the pasted prompt is the baseline,
-# not an event.
-n_ended=$(count 'free session ended'); n_takeover=$(count 'Take over'); n_released=$(count 'was released')
 continues=0 unreach_since=0 start=$SECONDS
 CONTINUE_MSG="Continue the same task from where you stopped. Check git status first and do not redo finished work. When done, write $RESULT as instructed, with the last line exactly $SENTINEL"
 
