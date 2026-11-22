@@ -38,9 +38,12 @@ name: autofix
 #   FREEBUFF_CREDENTIALS     Full contents of ~/.config/manicode/credentials.json from a
 #                            machine logged in to Freebuff. Or instead:
 #   CODEBUFF_API_KEY         A Codebuff API key. With neither set the fallback is off and
-#                            a Claude limit simply pauses fixing until it resets.
+#                            a Claude limit simply pauses fixing until it resets (the
+#                            scan job then queues no fix jobs at all).
 #                            Private app code is sent to Freebuff (ad-supported) only
-#                            while Claude is limited.
+#                            while Claude is limited. Use a SEPARATE Freebuff account for
+#                            CI: a run takes over the account's one session, ending yours
+#                            (repository variable FREEBUFF_TAKEOVER=no to fail instead).
 # ─────────────────────────────────────────────────────────────────────────────
 
 on:
@@ -85,12 +88,21 @@ jobs:
         with:
           persist-credentials: false
 
+      # Read-only here: whether Claude is blocked (see "Save AI provider state").
+      - name: Restore AI provider state
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.autofix-agent-state
+          key: autofix-ai-state-${{ github.run_id }}-${{ github.run_attempt }}-scan
+          restore-keys: autofix-ai-state-
+
       - name: Find apps with open autofix issues
         id: scan
         env:
           # Needs Issues: read on the bug repos. Same token as the fix job.
           GH_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
           AUTOFIX_ONLY_APP: ${{ inputs.app }}
+          HAVE_FREEBUFF: ${{ secrets.FREEBUFF_CREDENTIALS != '' || secrets.CODEBUFF_API_KEY != '' }}
         run: |
           set -o pipefail
           # Without a token every `gh issue list` fails, agent.sh's `|| echo 0`
@@ -100,6 +112,15 @@ jobs:
             exit 1
           fi
           apps=$(bash agent.sh --list-json)
+          # Claude out of quota and no fallback: a fix job could only clone, build
+          # and report "no AI" — every hour until the reset. Queue nothing instead.
+          if [ "$HAVE_FREEBUFF" != "true" ] && ! bash -c 'source lib/ai-provider.sh && claude_available'; then
+            until=$(head -1 ~/.autofix-agent-state/claude-blocked-until 2>/dev/null)
+            if [ "$apps" != "[]" ]; then
+              echo "::notice::Claude blocked until ${until} and no Freebuff fallback configured; skipping fix jobs ($apps)"
+            fi
+            apps='[]'
+          fi
           count=$(printf '%s' "$apps" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))")
           echo "apps=$apps"   >> "$GITHUB_OUTPUT"
           echo "count=$count" >> "$GITHUB_OUTPUT"
@@ -170,21 +191,23 @@ jobs:
             off; exit 0
           fi
           # Output stays off this public log except for the version number.
-          if ! command -v tmux >/dev/null; then
-            { sudo apt-get update -qq && sudo apt-get install -y -qq tmux; } >/dev/null 2>&1 || true
+          # tmux drives the TUI; setfacl (acl) walls the isolated autofix-fb user off
+          # from this user's HOME (ci/freebuff-run.sh, user mode).
+          if ! command -v tmux >/dev/null || ! command -v setfacl >/dev/null; then
+            { sudo apt-get update -qq && sudo apt-get install -y -qq tmux acl; } >/dev/null 2>&1 || true
           fi
           if ! command -v tmux >/dev/null || ! npm install -g freebuff >/dev/null 2>&1; then
             echo "::warning::tmux/freebuff install failed — Freebuff fallback off for this run"
             off; exit 0
           fi
+          ( umask 077; mkdir -p "$RUNNER_TEMP/freebuff-cfg" )
           if [ -n "${FREEBUFF_CREDENTIALS:-}" ]; then
-            umask 077
-            mkdir -p "$RUNNER_TEMP/freebuff-cfg"
-            printf '%s\n' "$FREEBUFF_CREDENTIALS" > "$RUNNER_TEMP/freebuff-cfg/credentials.json"
-            echo "FREEBUFF_CONFIG_DIR=$RUNNER_TEMP/freebuff-cfg" >> "$GITHUB_ENV"
+            ( umask 077; printf '%s\n' "$FREEBUFF_CREDENTIALS" > "$RUNNER_TEMP/freebuff-cfg/credentials.json" )
           fi
-          # The first run downloads the agent binary.
-          v=$(timeout 300 freebuff --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+          echo "FREEBUFF_CONFIG_DIR=$RUNNER_TEMP/freebuff-cfg" >> "$GITHUB_ENV"
+          # The first run downloads the agent binary (into FREEBUFF_CONFIG_DIR, from
+          # where ci/freebuff-run.sh copies it for the isolated user).
+          v=$(FREEBUFF_CONFIG_DIR="${RUNNER_TEMP}/freebuff-cfg" timeout 300 freebuff --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
           if [ -z "$v" ]; then
             echo "::warning::freebuff did not start — Freebuff fallback off for this run"
             off; exit 0
@@ -200,6 +223,12 @@ jobs:
           path: ~/.autofix-agent-state
           key: autofix-ai-state-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.app }}
           restore-keys: autofix-ai-state-
+
+      - name: Fingerprint AI provider state
+        id: state_before
+        run: |
+          mkdir -p ~/.autofix-agent-state
+          echo "hash=$(cd ~/.autofix-agent-state && find . -type f -exec sha256sum {} + | sort | sha256sum | cut -c1-64)" >> "$GITHUB_OUTPUT"
 
       - name: Configure git identity and credentials
         env:
@@ -319,9 +348,12 @@ jobs:
           APP_REPO_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Freebuff's own key (optional). lib/ai-provider.sh keeps it from Claude and
-          # ci/freebuff-run.sh keeps every other secret here from Freebuff.
-          CODEBUFF_API_KEY: ${{ secrets.CODEBUFF_API_KEY }}
+          # Freebuff's own key (optional), under a name no tool reads: lib/ai-provider.sh
+          # takes it out of the environment (so gradle/BUILD_CMD and Claude never see
+          # it) and the driver hands it to Freebuff alone as CODEBUFF_API_KEY.
+          AUTOFIX_CODEBUFF_API_KEY: ${{ secrets.CODEBUFF_API_KEY }}
+          # Pressing "Take over" ends the account's other session (docs/CLOUD.md).
+          FREEBUFF_TAKEOVER: ${{ vars.FREEBUFF_TAKEOVER || 'yes' }}
           APP: ${{ matrix.app }}
         run: |
           mkdir -p ~/.autofix-agent-state
@@ -339,9 +371,20 @@ jobs:
           echo "exit=$rc" >> "$GITHUB_OUTPUT"
           exit $rc
 
-      # Not when the run step never started: nothing changed, and the dir may not exist.
-      - name: Save AI provider state
+      # Only when the state changed (each save is a new cache entry). Not when the
+      # run step never started. Known race, accepted: a drift-release job running
+      # alongside can save a newer entry holding older state, so a fresh block is
+      # forgotten — the next Claude call rediscovers it within seconds.
+      - name: Fingerprint AI provider state again
+        id: state_after
         if: always() && steps.run.outcome != 'skipped'
+        run: |
+          mkdir -p ~/.autofix-agent-state
+          h=$(cd ~/.autofix-agent-state && find . -type f -exec sha256sum {} + | sort | sha256sum | cut -c1-64)
+          [ "$h" = "${{ steps.state_before.outputs.hash }}" ] && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save AI provider state
+        if: always() && steps.state_after.outputs.changed == 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.autofix-agent-state
@@ -399,10 +442,17 @@ jobs:
           printf '%s' "$lines" | grep -q 'Released '          && add "released"
           printf '%s' "$lines" | grep -qE 'UNRELEASED|Release FAILED' && add "NOT released"
           printf '%s' "$lines" | grep -q 'using Freebuff'     && add "via Freebuff"
-          printf '%s' "$lines" | grep -q 'AI unavailable'     && add "NO AI (Claude out of quota)"
+          printf '%s' "$lines" | grep -q 'No AI agent available' && add "NO AI (Claude out of quota)"
           printf '%s' "$lines" | grep -q 'release deferred'   && add "release deferred"
           verdict="${parts:-ran, no change}"
           [ "${RC:-0}" = "0" ] || verdict="$verdict (exit ${RC})"
+          # "No AI" is mailed once per Claude block (worker.sh report_no_ai): an
+          # otherwise empty run that only repeats it sends nothing.
+          if [ "$verdict" = "NO AI (Claude out of quota)" ] \
+             && printf '%s' "$lines" | grep -q 'already reported for the Claude block'; then
+            echo "No AI again, already reported for this Claude block — no mail."
+            exit 0
+          fi
 
           printf '%s\n\n%s\n\n%s\n' \
             "Autofix run for ${APP}: ${verdict}" \
@@ -601,6 +651,12 @@ jobs:
           key: autofix-ai-state-${{ github.run_id }}-${{ github.run_attempt }}-release-${{ matrix.app }}
           restore-keys: autofix-ai-state-
 
+      - name: Fingerprint AI provider state
+        id: state_before
+        run: |
+          mkdir -p ~/.autofix-agent-state
+          echo "hash=$(cd ~/.autofix-agent-state && find . -type f -exec sha256sum {} + | sort | sha256sum | cut -c1-64)" >> "$GITHUB_OUTPUT"
+
       - name: Publish the release
         id: publish
         env:
@@ -619,9 +675,18 @@ jobs:
           grep -E '^\[release\] ' "$RUNNER_TEMP/logs/${APP}-release.log" || echo "(no status lines)"
           exit $rc
 
-      # ci/release-app.sh records a Claude limit it runs into; keep it for the next hour.
-      - name: Save AI provider state
+      # ci/release-app.sh records a Claude limit it runs into; keep it for the next
+      # hour — only if something changed (same race note as the fix job).
+      - name: Fingerprint AI provider state again
+        id: state_after
         if: always() && steps.publish.outcome != 'skipped'
+        run: |
+          mkdir -p ~/.autofix-agent-state
+          h=$(cd ~/.autofix-agent-state && find . -type f -exec sha256sum {} + | sort | sha256sum | cut -c1-64)
+          [ "$h" = "${{ steps.state_before.outputs.hash }}" ] && echo "changed=false" >> "$GITHUB_OUTPUT" || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Save AI provider state
+        if: always() && steps.state_after.outputs.changed == 'true'
         uses: actions/cache/save@v4
         with:
           path: ~/.autofix-agent-state
