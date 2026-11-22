@@ -18,7 +18,8 @@ set -euo pipefail
 #             BUILD_CMD, BUILD_ENV_CHECK_CMD, APPROVED_BY, PROTECTED_PATHS
 ###############################################################################
 
-export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
+# AUTOFIX_PATH_PREPEND: tests put their fake gh/claude first (gh lives in /usr/bin).
+export PATH="${AUTOFIX_PATH_PREPEND:+$AUTOFIX_PATH_PREPEND:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
 unset CLAUDECODE  # prevent "nested session" error when run from cron
 
 # Prevent git SSH/HTTP operations from hanging indefinitely
@@ -733,6 +734,20 @@ issue_is_stuck() {
         | python3 -c "import sys,json; sys.exit(0 if any(l['name']=='$STUCK_LABEL' for l in json.load(sys.stdin).get('labels',[])) else 1)" 2>/dev/null
 }
 
+# While Claude is blocked every hourly run would report the same "no AI". One
+# report per app per block: the first run says so (and is mailed); later runs in
+# the same block log "already reported", which the workflow's mail step skips.
+report_no_ai() {
+    local until flag="$AUTOFIX_STATE_DIR/no-ai-reported-$APP_SLUG"
+    until=$(ai_blocked_until); until="${until:-unknown}"
+    if [[ "$(cat "$flag" 2>/dev/null)" == "$until" ]]; then
+        log "No AI this run; already reported for the Claude block until $until (no mail)"
+    else
+        mkdir -p "$AUTOFIX_STATE_DIR" 2>/dev/null && echo "$until" > "$flag" 2>/dev/null || true
+        log "No AI this run: Claude blocked until $until and Freebuff could not take over — issues left open"
+    fi
+}
+
 # ── Fix Execution ─────────────────────────────────────────────────────────────
 # Returns: 0 = fix applied & build passed, 1 = failure (attributable to the fix),
 #          2 = already fixed, 3 = build environment is broken (not the fix's fault),
@@ -767,7 +782,7 @@ attempt_fix() {
 
     if [[ $claude_exit -eq 4 ]]; then
         # Not the fix's fault and not the issue's: no AI could run at all.
-        AI_UNAVAILABLE="Claude blocked until ${AI_BLOCKED_UNTIL:-?} and Freebuff unavailable (${AI_UNAVAILABLE_REASON:-unknown})"
+        AI_UNAVAILABLE="Claude blocked until ${AI_BLOCKED_UNTIL:-$(ai_blocked_until)}; ${AI_UNAVAILABLE_REASON:-Freebuff unavailable}"
         return 4
     fi
     if [[ $claude_exit -ne 0 ]]; then
@@ -982,12 +997,13 @@ for i in issues: print(i["number"])')
             return 3
 
         elif [[ $fix_result -eq 4 ]]; then
-            # Like an environment fault, one step further out: no agent ran at all.
-            # Burning retries, labelling the issue stuck or commenting would each
-            # blame an issue nobody has looked at. It stays open and labelled for
-            # the next run.
+            # Like an environment fault, one step further out: no agent ran at all
+            # (or Freebuff's budget for this task/run is spent). Burning retries,
+            # labelling the issue stuck or commenting would each blame an issue
+            # nobody could look at. It stays open and labelled for the next run.
+            # A warning, not an ERROR: nothing is broken, Claude is out of quota.
             reset_to_task_head "$task_head"
-            log_error "AI unavailable: $AI_UNAVAILABLE — will retry next run"
+            log "No AI agent available: $AI_UNAVAILABLE — left open for the next run"
             return 4
         fi
 
@@ -1144,7 +1160,7 @@ main() {
     local any_fixed=false
     local any_failed=false
     local env_failed=false
-    local ai_unavailable=false
+    local ai_unavailable=false ai_stop=false
     local all_fixed_issues=()
     local round=1
 
@@ -1182,6 +1198,7 @@ print(", ".join("#"+str(i["number"]) for i in issues))')
 
             log "Processing task: $task_label"
             label_task_active "$task_file"
+            AI_TASK_KEY="$task_label"   # one Freebuff attempt per task (lib/ai-provider.sh)
 
             local task_log="$LOG_DIR/task_$(date +%Y%m%d_%H%M%S)_${task_label//[^0-9_]/_}.log"
 
@@ -1213,12 +1230,17 @@ with open(sys.argv[1]) as f: issues=json.load(f)
 for i in issues: print(i["number"])')
                 rm -f "$task_log.diff_summary" "$task_log.diff_detail" "$task_log.fix_summary" "$task_log.attempt"
             elif [[ $task_result -eq 4 ]]; then
-                # No AI for this app this run; every other task would get the same
-                # answer. The issue keeps its autofix label: next run picks it up.
-                any_failed=true
+                # No AI for this task. Not a failure (no red job every hour while
+                # Claude is out of quota): the issue keeps its autofix label and the
+                # next run picks it up. Scope "task" = only Freebuff's one attempt at
+                # this task is spent, so the next task may still get its own;
+                # otherwise every other task would get the same answer.
                 ai_unavailable=true
-                unlabel_task_active "$task_file"
-                break
+                if [[ "$AI_NO_AI_SCOPE" != "task" ]]; then
+                    ai_stop=true
+                    unlabel_task_active "$task_file"
+                    break
+                fi
             elif [[ $task_result -eq 3 ]]; then
                 # The environment, not this task. Every remaining task would hit the
                 # same wall, so stop rather than burn the rest of the budget on it.
@@ -1236,8 +1258,8 @@ for i in issues: print(i["number"])')
 
         # Not a break here: issues fixed earlier in this round are already closed,
         # so their commits must still be pushed below before stopping.
-        if [[ "$ai_unavailable" == "true" ]]; then
-            log_error "Stopping: no AI agent is available — remaining issues wait for the next run."
+        if [[ "$ai_stop" == "true" ]]; then
+            log "No AI agent for the rest of this run — remaining issues wait for the next run."
         fi
         if [[ "$env_failed" == "true" ]]; then
             log_error "Stopping: the build environment is broken, not the fixes."
@@ -1264,15 +1286,22 @@ for i in issues: print(i["number"])')
             break
         fi
 
-        [[ "$ai_unavailable" == "true" ]] && break
+        [[ "$ai_stop" == "true" ]] && break
         round=$((round + 1))
         sleep 5
     done
 
+    if [[ "$ai_unavailable" == "true" ]]; then
+        report_no_ai
+    fi
     if [[ "$any_fixed" == "true" ]]; then
         log "=== Post-fix: triggering release ==="
         trigger_release
-        log "=== Worker done: ${#all_fixed_issues[@]} issue(s) fixed ==="
+        if [[ "$RELEASE_DEFERRED" == "true" ]]; then
+            log "=== Worker done: ${#all_fixed_issues[@]} issue(s) fixed; release deferred until Claude is back ==="
+        else
+            log "=== Worker done: ${#all_fixed_issues[@]} issue(s) fixed ==="
+        fi
     else
         log "=== Worker done: no issues fixed ==="
     fi
