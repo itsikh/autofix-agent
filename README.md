@@ -190,11 +190,13 @@ Group related issues into a single Claude task by adding the same `story:<name>`
 | `AUTOFIX_MAX_PARALLEL` | `3` | Max concurrent workers in `agent.sh` |
 | `AUTOFIX_ONLY_APP` | — | Restrict the run to a single app slug |
 | `AUTOFIX_WORKSPACE` | — | If set, `PROJECT_DIR` becomes `<workspace>/<slug>` (CI) |
-
 | `AUTOFIX_FALLBACK` | `freebuff` | `none` disables the Freebuff fallback |
 | `AUTOFIX_STATE_DIR` | `~/.autofix-agent-state` | Claude reset time + provider switch log |
-| `FREEBUFF_TIMEOUT_MIN` | `60` | Max minutes for one Freebuff fix session |
-| `FREEBUFF_CONFIG_DIR` | `~/.config/manicode` | Freebuff credentials dir (absolute); or set `CODEBUFF_API_KEY` |
+| `FREEBUFF_TIMEOUT_MIN` | `60` | Max minutes for one Freebuff run, wait in line included |
+| `AUTOFIX_FREEBUFF_BUDGET_MIN` | `90` | Total Freebuff minutes per worker run (one attempt per issue) |
+| `FREEBUFF_CONFIG_DIR` | `~/.config/manicode` | Freebuff credentials dir (absolute); or set `AUTOFIX_CODEBUFF_API_KEY` |
+| `FREEBUFF_TAKEOVER` | `yes` in CI, else `no` | Press "Take over" when the account's session is in use elsewhere (ends that session) |
+| `FREEBUFF_ISOLATION` | `auto` | `user` = run as the `autofix-fb` user (CI default), `same` = as you (local default) |
 
 Override: `AUTOFIX_MAX_PARALLEL=5 ./agent.sh`
 
@@ -213,15 +215,17 @@ the same fix with [Freebuff](https://freebuff.com) — the free, ad-supported
 Codebuff agent, driven headlessly through tmux by `ci/freebuff-run.sh`. Claude is
 not called again until the reset time; then it is tried first, and a success
 switches back. Every switch is logged as an `AI-PROVIDER:` line. If Freebuff is
-unavailable as well, the issue is left untouched for the next run (no retry
-spent, no stuck label). `/release` is deferred while Claude is blocked.
+unavailable as well (or its per-run budget is spent), the issue is left untouched
+for the next run (no retry spent, no stuck label, exit 0, mailed once per block).
+`/release` is deferred while Claude is blocked.
 
-**Privacy:** Freebuff is ad-supported and some of its models may retain or train
-on prompts, so private app code is sent to it — only while Claude is out of
-quota, and with every credential but its own removed from its environment.
+**Privacy:** Freebuff is ad-supported; its default model (Beam 1.0) is shown with
+"May use data for AI training". Private app code is sent to it — only while
+Claude is out of quota, with every credential but its own removed from its
+environment and, in CI, as an isolated user that cannot read the runner's files.
 Disable with `AUTOFIX_FALLBACK=none` (or, in CI, by not setting the Freebuff
 secret). Details, secrets and the switch-back: [docs/CLOUD.md](docs/CLOUD.md#freebuff-fallback).
-Tests: `bash tests/test-ai-fallback.sh`.
+Tests: `bash tests/test-ai-fallback.sh` and `bash tests/test-worker-noai.sh`.
 
 ## Logs
 
