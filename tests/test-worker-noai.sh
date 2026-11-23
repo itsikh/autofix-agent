@@ -11,6 +11,8 @@
 #     (RELEASE_DEFERRED in the final line) without invoking Claude;
 #   - ci/release-app.sh and the drift-scan hold defer while Claude is blocked.
 set -uo pipefail
+# Hermetic on an Actions runner too: nothing here may pick the real sudo or CI paths.
+unset GITHUB_ACTIONS RUNNER_TEMP AUTOFIX_SECRET_FILES
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(dirname "$HERE")"
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
@@ -107,12 +109,16 @@ check "no AI, new block: reported again" grep -q "No AI this run: Claude blocked
 rm -f "$FAKE/fb-calls"
 
 # ── 2. One Freebuff attempt per issue ────────────────────────────────────────
-block; issues 21 22; echo 1 > "$FAKE/fb-rc"
+# Scope "task": a neutral line, not "no AI" — no report, no mail flag used up.
+block; issues 21 22; echo 1 > "$FAKE/fb-rc"; rm -f "$STATE"/no-ai-reported-*
 rc=$(runw)
 check "one attempt per issue: exit 0" test "$rc" = 0
 check "one attempt per issue: exactly one Freebuff run per issue (2)" test "$(calls fb-calls)" = 2
 check "one attempt per issue: no stuck label, no comment" nott grep -qE -- "--add-label autofix-stuck|gh issue comment" "$FAKE/gh.log"
-check "one attempt per issue: logged as no AI for the task" grep -q "No AI agent available: .*one attempt at this task" "$T/w.out"
+check "one attempt per issue: neutral line for the task" grep -q "Freebuff already tried this task this run — left open for the next run" "$T/w.out"
+check "one attempt per issue: not reported as 'No AI agent available' (the mail verdict)" nott grep -q "No AI agent available" "$T/w.out"
+check "one attempt per issue: no 'No AI this run' report" nott grep -q "No AI this run" "$T/w.out"
+check "one attempt per issue: the once-per-block mail flag is not used up" bash -c '! ls "$1"/no-ai-reported-* >/dev/null 2>&1' _ "$STATE"
 check "one attempt per issue: tree back at the task commit" test -z "$(git -C "$R" status --porcelain)"
 rm -f "$FAKE/fb-calls"
 
