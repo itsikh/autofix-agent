@@ -799,7 +799,10 @@ attempt_fix() {
     # this explicitly: repairing the build and committing the repair is how an app
     # fix ends up carrying wrapper churn it has no business touching.
     if echo "$claude_output" | grep -q "BUILD_ENV_BROKEN:"; then
-        BUILD_ENV_ERROR="$(echo "$claude_output" | grep -m1 "BUILD_ENV_BROKEN:" | sed 's/.*BUILD_ENV_BROKEN: *//' | cut -c1-300)"
+        # Agent text on its way to a PUBLIC status line (ERROR: ...): whitelisted
+        # characters, 160 at most. A Freebuff session is less trusted than Claude.
+        BUILD_ENV_ERROR="$(echo "$claude_output" | grep -m1 "BUILD_ENV_BROKEN:" | sed 's/.*BUILD_ENV_BROKEN: *//' \
+            | tr -cd '[:alnum:] ,.;:()/_+=-' | cut -c1-160)"
         log_error "$agent reports the build environment is broken: $BUILD_ENV_ERROR"
         return 3
     fi
@@ -1003,7 +1006,12 @@ for i in issues: print(i["number"])')
             # nobody could look at. It stays open and labelled for the next run.
             # A warning, not an ERROR: nothing is broken, Claude is out of quota.
             reset_to_task_head "$task_head"
-            log "No AI agent available: $AI_UNAVAILABLE — left open for the next run"
+            if [[ "$AI_NO_AI_SCOPE" == "task" ]]; then
+                # Only this task's one Freebuff attempt is spent: not a "no AI" run.
+                log "Freebuff already tried this task this run — left open for the next run"
+            else
+                log "No AI agent available: $AI_UNAVAILABLE — left open for the next run"
+            fi
             return 4
         fi
 
@@ -1235,8 +1243,9 @@ for i in issues: print(i["number"])')
                 # next run picks it up. Scope "task" = only Freebuff's one attempt at
                 # this task is spent, so the next task may still get its own;
                 # otherwise every other task would get the same answer.
-                ai_unavailable=true
+                # Only scope "job" is a no-AI run (reported, mailed once per block).
                 if [[ "$AI_NO_AI_SCOPE" != "task" ]]; then
+                    ai_unavailable=true
                     ai_stop=true
                     unlabel_task_active "$task_file"
                     break

@@ -69,6 +69,10 @@ ai_log() {
     local msg="AI-PROVIDER: $*"
     if declare -F log >/dev/null; then log "$msg"; else echo "$msg"; fi
     mkdir -p "$AUTOFIX_STATE_DIR" 2>/dev/null || return 0
+    # The same entry as the last one (every hourly run while Claude is blocked says
+    # "using Freebuff") is not repeated: the state, and its cache entry, only
+    # change when something does.
+    [[ "$(tail -n 1 "$AI_SWITCH_LOG" 2>/dev/null | cut -f2-)" == "${APP_SLUG:--}"$'\t'"$*" ]] && return 0
     printf '%s\t%s\t%s\n' "$(date -u -d "@$(ai_now)" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%SZ)" \
         "${APP_SLUG:--}" "$*" >> "$AI_SWITCH_LOG" 2>/dev/null || true
     # It travels in the Actions cache: keep it bounded.
@@ -302,37 +306,88 @@ _ai_run_freebuff() {
     [[ $tmo -gt $remaining ]] && tmo=$remaining
 
     AI_AGENT_USED="Freebuff"
-    # The prompt and the result live outside the repo: a result file inside the
-    # tree would be committed by `git add -A` as part of the fix.
-    local d rc=0 t_start=$SECONDS line
+    # The prompt, the result, the driver's output and the pane live outside the
+    # repo: a result file inside the tree would be committed by `git add -A`, and
+    # .autofix-logs belongs to the agent while it runs (user mode chowns the
+    # project to it), so nothing is written there until the run is over and the
+    # directory has been checked (_ai_safe_logdir).
+    local d rc=0 t_start=$SECONDS line r
     d=$(mktemp -d "${TMPDIR:-/tmp}/autofix-fb.XXXXXX")
     chmod 700 "$d"
     printf '%s\n' "$prompt" > "$d/prompt.txt"
     chmod 644 "$d/prompt.txt"
     if declare -F log >/dev/null; then log "Invoking Freebuff..."; fi
-    FREEBUFF_PANE_LOG="${task_log}.freebuff-pane" FREEBUFF_TIMEOUT_SEC="$tmo" \
+    FREEBUFF_PANE_LOG="$d/pane" FREEBUFF_TIMEOUT_SEC="$tmo" \
         AUTOFIX_CODEBUFF_API_KEY="$AI_CODEBUFF_KEY" \
         ${AI_AGENT_ENV[@]+"${AI_AGENT_ENV[@]}"} "$AUTOFIX_FREEBUFF_RUN" "$PWD" "$d/prompt.txt" "$d/result.txt" \
-        >> "$task_log" 2>&1 || rc=$?
+        > "$d/driver.out" 2>&1 || rc=$?
     printf '%s\t%s\n' "${AI_TASK_KEY:--}" "$((SECONDS - t_start))" >> "$ledger"
+    # From here on every git command of this shell (the worker's diff, commit,
+    # push) ignores fsmonitor and hooks, whatever the agent left in .git.
+    ai_git_harden
+    _ai_safe_logdir "$(dirname "$task_log")"
+    cat "$d/driver.out" >> "$task_log"
     # The driver's public notices (fixed strings, no content), e.g. a credentials refresh.
-    while IFS= read -r line; do
-        ai_log "$(printf '%s' "$line" | tr -cd '[:alnum:] ,.;:()/_+-' | cut -c1-200)"
-    done < <(cat "$d/result.txt.notice" 2>/dev/null)
-    if [[ -f "$d/result.txt" ]]; then
-        cat "$d/result.txt" > "$out_file"
+    if [[ -f "$d/result.txt.notice" && ! -L "$d/result.txt.notice" ]]; then
+        while IFS= read -r line; do
+            ai_log "$(printf '%s' "$line" | tr -cd '[:alnum:] ,.;:()/_+-' | cut -c1-200)"
+        done < <(head -c 4096 "$d/result.txt.notice")
+    fi
+    if [[ -f "$d/result.txt" && ! -L "$d/result.txt" ]]; then
+        head -c 65536 "$d/result.txt" > "$out_file"
         # The task log is where FIX_SUMMARY is extracted from, as with Claude's output.
-        cat "$d/result.txt" >> "$task_log"
+        cat "$out_file" >> "$task_log"
     else
         : > "$out_file"
     fi
+    if [[ -s "$d/pane" && ! -L "$d/pane" ]]; then
+        head -c 2000000 "$d/pane" > "${task_log}.freebuff-pane"
+    fi
     if [[ $rc -eq 4 ]]; then
-        AI_UNAVAILABLE_REASON=$(tail -1 "$d/result.txt.reason" 2>/dev/null | cut -c1-200)
-        [[ -z "$AI_UNAVAILABLE_REASON" ]] && AI_UNAVAILABLE_REASON="Freebuff unavailable"
+        # Only one of the driver's own fixed reasons reaches the public status line.
+        r=""
+        [[ -f "$d/result.txt.reason" && ! -L "$d/result.txt.reason" ]] && r=$(tail -n 1 "$d/result.txt.reason" | head -c 200)
+        AI_UNAVAILABLE_REASON="Freebuff unavailable"
+        for line in "${AI_FB_REASONS[@]}"; do
+            [[ "$r" == "$line" ]] && { AI_UNAVAILABLE_REASON="$r"; break; }
+        done
     fi
     rm -rf "$d"
     [[ $rc -eq 0 || $rc -eq 4 ]] && return $rc
     return 1
+}
+
+# Every reason ci/freebuff-run.sh may give for an exit 4 (its `unavailable` calls).
+AI_FB_REASONS=(
+    "result file must be an absolute path" "no project dir" "result file must be outside the repo"
+    "tmux not installed" "freebuff not installed" "FREEBUFF_CONFIG_DIR must be absolute" "not logged in"
+    "isolation unavailable" "isolation setup failed" "freebuff installed under the runner HOME"
+    "could not start tmux" "session in use elsewhere" "freebuff did not show its prompt"
+    "still waiting in line at the deadline" "the tmux session died at startup" "freebuff exited at startup"
+    "free allowance used up" "logged out during the run" "Freebuff servers unreachable"
+    "repository tampered by the agent" "no result and no change in the repo"
+)
+
+# After an agent owned the project: the log dir is a real directory and holds no
+# symlinks, FIFOs or devices, so the worker's later writes ($task_log,
+# $task_log.fix_summary, ...) cannot land in the runner's files (~/.gitconfig).
+_ai_safe_logdir() {
+    local dir="$1"
+    if [[ -L "$dir" || ( -e "$dir" && ! -d "$dir" ) ]]; then rm -f -- "$dir"; fi
+    mkdir -p "$dir"
+    find "$dir" -mindepth 1 -maxdepth 1 ! -type f ! -type d -exec rm -f -- {} + 2>/dev/null
+    return 0
+}
+
+# GIT_CONFIG_COUNT entries outrank .git/config: core.fsmonitor and hooks are off
+# for every later git command of this process and its children. Once per process.
+ai_git_harden() {
+    [[ -n "${AI_GIT_HARDENED:-}" ]] && return 0
+    local n="${GIT_CONFIG_COUNT:-0}"
+    export "GIT_CONFIG_KEY_$n=core.fsmonitor" "GIT_CONFIG_VALUE_$n=false"
+    n=$((n + 1))
+    export "GIT_CONFIG_KEY_$n=core.hooksPath" "GIT_CONFIG_VALUE_$n=/dev/null"
+    export GIT_CONFIG_COUNT=$((n + 1)) AI_GIT_HARDENED=1
 }
 
 # run_fix_agent <prompt> <task_log> <out_file> [stdin|arg]
@@ -344,11 +399,6 @@ _ai_run_freebuff() {
 run_fix_agent() {
     local prompt="$1" task_log="$2" out_file="$3" mode="${4:-${CLAUDE_PROMPT_MODE:-arg}}"
     AI_AGENT_USED="" AI_UNAVAILABLE_REASON="" AI_BLOCKED_UNTIL="" AI_NO_AI_SCOPE="job"
-# job = no AI for anything this run (stop); task = only this task is out of
-# Freebuff attempts (move on to the next one).
-AI_NO_AI_SCOPE="job"
-# Identifies the task for the one-Freebuff-attempt-per-task rule (worker.sh).
-AI_TASK_KEY="${AI_TASK_KEY:-}"
     : > "$out_file"
 
     local stale=""
