@@ -1,0 +1,31 @@
+# Offline tests (fakes only: no network agent, no real sudo, no secrets).
+# Safe on a public repo: push to feature branches and manual runs only — no
+# pull_request / pull_request_target, no secrets, read-only token.
+name: tests
+
+on:
+  push:
+    branches: ['feature/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install tmux and acl
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq tmux acl
+      - name: bash -n
+        run: find . -name '*.sh' -not -path './.git/*' -print0 | xargs -0 -n1 bash -n
+      - name: test-ai-fallback
+        run: bash tests/test-ai-fallback.sh
+      - name: test-worker-noai
+        run: bash tests/test-worker-noai.sh
+      - name: test-approval-gate
+        run: bash tests/test-approval-gate.sh

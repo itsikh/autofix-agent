@@ -222,10 +222,14 @@ for the next run (no retry spent, no stuck label, exit 0, mailed once per block)
 **Privacy:** Freebuff is ad-supported; its default model (Beam 1.0) is shown with
 "May use data for AI training". Private app code is sent to it — only while
 Claude is out of quota, with every credential but its own removed from its
-environment and, in CI, as an isolated user that cannot read the runner's files.
+environment and, in CI, as an isolated user that cannot read the runner's files
+(signing files placed in the clone are moved out for the session). That
+protects secrets from being *read* during the session; it is not a sandbox for
+the code the agent writes, which the verification build then runs as the
+runner, as it does Claude's.
 Disable with `AUTOFIX_FALLBACK=none` (or, in CI, by not setting the Freebuff
 secret). Details, secrets and the switch-back: [docs/CLOUD.md](docs/CLOUD.md#freebuff-fallback).
-Tests: `bash tests/test-ai-fallback.sh` and `bash tests/test-worker-noai.sh`.
+Tests: `bash tests/test-ai-fallback.sh`, `bash tests/test-worker-noai.sh` and `bash tests/test-approval-gate.sh` (also run by `.github/workflows/tests.yml` on `feature/**` pushes; no secrets).
 
 ## Logs
 

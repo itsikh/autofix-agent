@@ -280,20 +280,50 @@ FREEBUFF_CREDENTIALS secret if runs start failing to log in` (never the
 content). If runs then start reporting "not logged in", paste a fresh
 `credentials.json` into the secret.
 
-**Isolation.** In CI (`GITHUB_ACTIONS=true` and passwordless sudo), Freebuff
-runs as a dedicated unprivileged user, `autofix-fb`, created once with
-`useradd`:
+**Isolation.** In CI (`GITHUB_ACTIONS=true`), Freebuff runs as a dedicated
+unprivileged user, `autofix-fb`, created once with `useradd`. If the runner has
+no passwordless sudo or no `setfacl`, the run stops with "isolation unavailable"
+(no AI for that task) rather than falling back to the runner user; set
+`FREEBUFF_ISOLATION=same` to accept the unisolated mode explicitly.
 - **Home and environment:** a throwaway HOME and a clean `env -i`
-  environment. Its own copy of the Freebuff config (credentials `600`, owned by
-  it) and its own tmux server.
+  environment, plus `JAVA_HOME`, `ANDROID_HOME` and `ANDROID_SDK_ROOT`, and a
+  `~/.gradle/gradle.properties` holding only the runner's
+  `org.gradle.java.home` and `org.gradle.jvmargs`. Its own copy of the
+  Freebuff config (credentials `600`, owned by it) and its own tmux server.
+  The runner's Gradle cache sits behind the HOME deny below, so its builds
+  download dependencies afresh (slower, by design).
 - **Project:** bind-mounted into that HOME, and chowned to `autofix-fb` for the
-  run and back afterwards. `keystore.properties` is moved out of the tree for
-  the run and restored by a trap.
+  run and back afterwards (then `chmod -R u+rwX`). The teardown also runs on
+  TERM/INT/HUP, cannot be cut short by a second signal, and never deletes the
+  throwaway HOME while the project is still mounted in it.
+- **Signing secrets out of the tree:** `ci/clone-app.sh` lists every secret
+  file it places in the clone (`keystore.properties`, `local.properties` with
+  the release passwords for cash/mychef, the `*-release.jks`) in
+  `$RUNNER_TEMP/autofix-secret-files`. For the session the driver moves each
+  one out: `local.properties` keeps only its non-secret lines (`sdk.dir`),
+  other `.properties` files keep their keys with placeholder values (so Gradle
+  still configures), keystores are absent. All are restored afterwards. This
+  happens in same-user mode too.
+- **Nothing left behind for the runner to execute:** after the session,
+  `.git/config`, `.git/hooks` and `.git/info/attributes` are restored from a
+  snapshot (an added `core.fsmonitor`, hook or filter is gone), and a
+  substituted `.git` disables the repository (exit 4). The worker also runs
+  every later git command with `core.fsmonitor=false` and
+  `core.hooksPath=/dev/null`. The result file is read as `autofix-fb`, at most
+  64 KB and never through a symlink, and symlinks/FIFOs planted in
+  `.autofix-logs` are removed before the worker writes there.
 - **No access to the runner's files:** the runner's HOME, `~/.ssh` and
   `$RUNNER_TEMP` get an explicit no-access ACL for `autofix-fb`. So it cannot
   read the SSH key, the signing keystore, the runner's
   `GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_OUTPUT` files or anything else of the
   runner user's.
+
+**What the isolation is not.** It keeps the runner's secrets from being *read*
+during the Freebuff session. It is **not a sandbox for the code the agent
+writes**: the verification build that follows (`./gradlew`, `BUILD_CMD`) runs
+that code as the runner user, with the signing material back in place, exactly
+as it does Claude's code. Review what Freebuff fixes as you would any
+contribution.
 
 Locally (VM/Mac, no passwordless sudo), Freebuff runs as you with a scrubbed
 environment and a one-line warning: it can read your files. This user-mode path
