@@ -198,6 +198,13 @@ KS="$DEST/keystore.properties"
 SIGNING_PROPS_FILE="${SIGNING_PROPS_FILE:-keystore.properties}"
 KEYSTORE_PATH_KEY="${KEYSTORE_PATH_KEY:-storeFile}"
 
+# Every secret file placed below is listed (one absolute path per line) OUTSIDE
+# the tree, in $RUNNER_TEMP/autofix-secret-files (AUTOFIX_SECRET_FILES overrides),
+# so ci/freebuff-run.sh can keep them out of the tree while Freebuff, a third
+# party, works in it.
+SECRET_FILES_LIST="${AUTOFIX_SECRET_FILES:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/autofix-secret-files}"
+record_secret() { ( umask 077; printf '%s\n' "$1" >> "$SECRET_FILES_LIST" ) || log "WARNING: could not record $1 as a secret file"; }
+
 have_real_keystore() {
     [[ -n "${AUTOFIX_KEYSTORE_FILE:-}" && -f "${AUTOFIX_KEYSTORE_FILE}" \
     && -n "${AUTOFIX_KEYSTORE_PROPERTIES:-}" && -f "${AUTOFIX_KEYSTORE_PROPERTIES}" ]]
@@ -216,6 +223,7 @@ install_signing_material() {
         mkdir -p "$(dirname "$dest")"
         cp "$AUTOFIX_KEYSTORE_FILE" "$dest"
         chmod 600 "$dest"
+        record_secret "$dest"
         ks_abs="$dest"
         log "keystore placed at $dest"
     fi
@@ -246,6 +254,7 @@ install_signing_material() {
         neutralise "$SIGNING_PROPS_FILE"
     fi
     chmod 600 "$target"
+    record_secret "$target"
     log "installed real signing material into $SIGNING_PROPS_FILE — releases can be signed here"
 }
 
@@ -297,6 +306,7 @@ storePassword=ci-placeholder
 keyAlias=ci-placeholder
 keyPassword=ci-placeholder
 KSEOF
+    record_secret "$KS"
 fi
 
 log "ready at $DEST"
