@@ -43,6 +43,7 @@ CLOUD — .github/workflows/autofix.yml (hourly)
    - Groups issues by `story:*` label
    - For each task: prompts Claude CLI to fix, verifies the build, commits, closes the issue on GitHub
    - After all tasks: triggers `/release`
+   - While Claude is out of quota, fixes run on Freebuff instead and `/release` waits — see [Freebuff fallback](#freebuff-fallback)
 
 3. **`wrapper.sh`** catches `agent.sh` failures, asks Claude to diagnose and fix the script itself, then retries (up to 2 meta-retries).
 
@@ -112,7 +113,11 @@ autofix-agent/
 ├── .github/workflows/
 │   └── autofix.yml     ← hourly cloud run (GitHub Actions)
 ├── ci/
-│   └── clone-app.sh    ← clones one app into the CI workspace
+│   ├── clone-app.sh    ← clones one app into the CI workspace
+│   └── freebuff-run.sh ← drives the Freebuff TUI through tmux (fallback)
+├── lib/
+│   └── ai-provider.sh  ← Claude ↔ Freebuff switch (limit detection, reset time)
+├── tests/              ← offline tests (bash tests/test-*.sh)
 ├── cloud/              ← paid-VM fallback (see docs/CLOUD.md)
 │   └── gradle.properties
 ├── setup-cloud.sh      ← provisions a GCE VM (fallback path)
@@ -185,6 +190,13 @@ Group related issues into a single Claude task by adding the same `story:<name>`
 | `AUTOFIX_MAX_PARALLEL` | `3` | Max concurrent workers in `agent.sh` |
 | `AUTOFIX_ONLY_APP` | — | Restrict the run to a single app slug |
 | `AUTOFIX_WORKSPACE` | — | If set, `PROJECT_DIR` becomes `<workspace>/<slug>` (CI) |
+| `AUTOFIX_FALLBACK` | `freebuff` | `none` disables the Freebuff fallback |
+| `AUTOFIX_STATE_DIR` | `~/.autofix-agent-state` | Claude reset time + provider switch log |
+| `FREEBUFF_TIMEOUT_MIN` | `60` | Max minutes for one Freebuff run, wait in line included |
+| `AUTOFIX_FREEBUFF_BUDGET_MIN` | `90` | Total Freebuff minutes per worker run (one attempt per issue) |
+| `FREEBUFF_CONFIG_DIR` | `~/.config/manicode` | Freebuff credentials dir (absolute); or set `AUTOFIX_CODEBUFF_API_KEY` |
+| `FREEBUFF_TAKEOVER` | `yes` in CI, else `no` | Press "Take over" when the account's session is in use elsewhere (ends that session) |
+| `FREEBUFF_ISOLATION` | `auto` | `user` = run as the `autofix-fb` user (CI default), `same` = as you (local default) |
 
 Override: `AUTOFIX_MAX_PARALLEL=5 ./agent.sh`
 
@@ -194,6 +206,30 @@ Useful flags:
 ./agent.sh --list-json     # print apps with unclaimed issues as JSON; run no workers
 ./agent.sh --max-parallel 5
 ```
+
+## Freebuff fallback
+
+When Claude reports a usage limit (weekly/session limit, `usage limit reached`,
+low credit, 429), the worker records the reset time, resets the tree, and reruns
+the same fix with [Freebuff](https://freebuff.com) — the free, ad-supported
+Codebuff agent, driven headlessly through tmux by `ci/freebuff-run.sh`. Claude is
+not called again until the reset time; then it is tried first, and a success
+switches back. Every switch is logged as an `AI-PROVIDER:` line. If Freebuff is
+unavailable as well (or its per-run budget is spent), the issue is left untouched
+for the next run (no retry spent, no stuck label, exit 0, mailed once per block).
+`/release` is deferred while Claude is blocked.
+
+**Privacy:** Freebuff is ad-supported; its default model (Beam 1.0) is shown with
+"May use data for AI training". Private app code is sent to it — only while
+Claude is out of quota, with every credential but its own removed from its
+environment and, in CI, as an isolated user that cannot read the runner's files
+(signing files placed in the clone are moved out for the session). That
+protects secrets from being *read* during the session; it is not a sandbox for
+the code the agent writes, which the verification build then runs as the
+runner, as it does Claude's.
+Disable with `AUTOFIX_FALLBACK=none` (or, in CI, by not setting the Freebuff
+secret). Details, secrets and the switch-back: [docs/CLOUD.md](docs/CLOUD.md#freebuff-fallback).
+Tests: `bash tests/test-ai-fallback.sh`, `bash tests/test-worker-noai.sh` and `bash tests/test-approval-gate.sh` (also run by `.github/workflows/tests.yml` on `feature/**` pushes; no secrets).
 
 ## Logs
 

@@ -22,9 +22,11 @@ set -uo pipefail
 #   Closed       the ticket was handled          ERROR:    anything that went wrong,
 #   ===          run start/finish verdict                  including "All N attempts
 #   Task/Issue/Build/Pushed/Acquired/No/Skipping             failed" and UNRELEASED
+#   AI-PROVIDER: Claude <-> Freebuff switches (limit text and times only,
+#                never prompt or model output — lib/ai-provider.sh)
 ###############################################################################
 
 LOG="${1:?usage: status-lines.sh <logfile>}"
 
-grep -E '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}\] \[[a-z0-9-]+\] (ERROR|===|Task |Issue |Build |Processing |Fix |Labelled |Pushed|Closed|No |Acquired|Released|Skipping)' \
+grep -E '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8}\] \[[a-z0-9-]+\] (ERROR|===|Task |Issue |Build |Processing |Fix |Labelled |Pushed|Closed|No |Acquired|Released|Skipping|AI-PROVIDER:)' \
     "$LOG"

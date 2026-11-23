@@ -139,6 +139,8 @@ sensitive is committed to this repo.
 | `AUTOFIX_MAIL_TO` | no | Recipient for run digests. Unset means no email; runs are unaffected. |
 | `AUTOFIX_MAIL_USER` | no | SMTP username, e.g. your Gmail address. |
 | `AUTOFIX_MAIL_PASS` | no | SMTP password — a Gmail **app password**, never the account password. |
+| `FREEBUFF_CREDENTIALS` | no | Full contents of `~/.config/manicode/credentials.json` from a machine logged in to Freebuff. Enables the [Freebuff fallback](#freebuff-fallback). |
+| `CODEBUFF_API_KEY` | no | Alternative to the above: a Codebuff API key for Freebuff. |
 
 \* Set one or the other. `CLAUDE_CODE_OAUTH_TOKEN` uses the subscription you
 already pay for; `ANTHROPIC_API_KEY` adds metered API charges.
@@ -169,6 +171,13 @@ exists for — a filed bug becoming an installable version without a human.
 - **SSH key** is written under `umask 077`, `chmod 600`, with `bitbucket.org`
   pinned via `ssh-keyscan`.
 
+- **Freebuff credentials** are written under `umask 077` to
+  `$RUNNER_TEMP/freebuff-cfg/` and deleted by an `always()` step. The
+  `CODEBUFF_API_KEY` secret reaches only the run step, as
+  `AUTOFIX_CODEBUFF_API_KEY`, and from there only the Freebuff driver. Freebuff
+  itself gets none of the other secrets and, in CI, runs as an isolated user
+  (see below).
+
 ### ⚠️ Public logs
 
 This repo is public, so **Actions logs are world-readable** — and worker output
@@ -178,6 +187,164 @@ status lines.
 
 Run with `verbose_logs: true` (workflow_dispatch) to print everything. Only do
 that when debugging an app whose contents you are comfortable publishing.
+
+## Freebuff fallback
+
+When Claude is out of quota (`You've hit your weekly limit · resets 5pm (UTC)`,
+`Claude AI usage limit reached|<epoch>`, `Credit balance is too low`, API 429 /
+`rate_limit_error` / `overloaded_error`), a run used to fail every attempt in
+seconds, burn the retries and label the issue `autofix-stuck` for something no
+fix could change. Now fixes fall back to [Freebuff](https://freebuff.com), the
+free ad-supported Codebuff agent, until Claude's limit resets.
+
+**How it works** (`lib/ai-provider.sh`, `ci/freebuff-run.sh`):
+
+1. Every fix session goes through `run_fix_agent`. Claude runs exactly as
+   before. A limit is only looked for when Claude **failed**, or when its whole
+   output is a tiny notice (under 400 bytes, no `FIX_SUMMARY`, HEAD and tree
+   untouched). A successful fix whose summary mentions "429" or "daily limit" is
+   never a switch. 429 / `rate_limit_error` / `overloaded_error` count only
+   after `API Error:`.
+2. The reset time is parsed (next occurrence, +1 minute) and stored in
+   `~/.autofix-agent-state/claude-blocked-until`. Without a stated reset: one
+   hour, or **15 minutes** for a 429/529 (usually brief: not worth sending code
+   to a third party for an hour).
+3. The tree is reset to the task's starting commit and the same prompt goes to
+   Freebuff. Freebuff is a TUI only, so `ci/freebuff-run.sh` drives it in a
+   private tmux server: it waits for the input prompt, then pastes the task plus
+   rules (stay in the repo, no push, no `gh`, write a summary file outside the
+   repo ending in `FREEBUFF-DONE`). It sends "continue" when a free session
+   ends. The result file carries `ALREADY_FIXED:` / `BUILD_ENV_BROKEN:` /
+   `FIX_SUMMARY` exactly like Claude's output, and the fix is built and verified
+   the same way. Login and allowance failures are read only from the TUI's
+   chrome (status bar, input box, modals; the agent's transcript is indented),
+   and only once they have stayed on screen for 3 polls. So app code that
+   contains "Not logged in" cannot end a run.
+4. **Budget.** One deadline per Freebuff run, counted from its start, covers
+   the wait in line and the work (`FREEBUFF_TIMEOUT_MIN`, 60). Each issue gets
+   **one** Freebuff attempt per run (no retries on Freebuff). The total
+   Freebuff time per job is capped at `AUTOFIX_FREEBUFF_BUDGET_MIN` (90), so
+   the 150-minute job timeout is never reached. Past either limit, the remaining
+   issues are left open, exactly as in step 7.
+5. Until the stored time passes, Claude is not called at all. After it, Claude
+   is tried first again. The first Claude run that ends without a limit notice
+   (successful or not) deletes the state and logs "back to Claude" once.
+6. Each switch is an `AI-PROVIDER:` status line in the public job log and in
+   `~/.autofix-agent-state/provider-switch.log` (last 200 lines kept). Only a
+   fixed label plus the reset time is logged, never model output:
+   `AI-PROVIDER: Claude limit hit (weekly limit · resets 5pm (UTC)); Claude blocked until 2026-11-23T17:01Z; using Freebuff`.
+7. **No AI.** Freebuff may be unavailable too: not logged in, free allowance
+   used up, servers unreachable, nothing happened before the deadline, or its
+   budget is spent. Then the run logs `No AI agent available: …` (a warning,
+   not an error) and **exits 0**. The issue stays open and labelled, with no
+   retry spent, no `autofix-stuck` label and no comment. The first such run in
+   a Claude block is mailed. Later runs in the same block log "already reported
+   for the Claude block until …", and the mail step sends nothing for them
+   (`no-ai-reported-<app>` in the state dir).
+8. **No fallback configured.** If no Freebuff secret is set and Claude is
+   blocked, the `scan` job queues **no fix jobs** at all (notice: "Claude blocked
+   until X and no Freebuff fallback configured; skipping fix jobs"). So there are
+   no clones, builds or mails until the reset.
+9. `/release` stays Claude-only. While Claude is blocked it is skipped
+   ("release deferred", also in the run's final line), not failed, and
+   `drift-scan` holds `drift-release` with a notice. Once Claude is back, the
+   drift backstop publishes the release.
+
+The state survives the ephemeral runners through `actions/cache` (prefix
+`autofix-ai-state-`, newest wins). It holds timestamps and the switch log only,
+and is saved only when it changed. A known race, accepted: a drift-release job
+running alongside a fix job can save a newer entry that holds older state. A
+fresh block is then forgotten, and the next Claude call rediscovers it within
+seconds. Without the cache nothing breaks either: Claude is tried, the limit
+is recognised within seconds and the switch happens anyway.
+
+**Secrets:** `FREEBUFF_CREDENTIALS` (log in once with `freebuff` on any machine,
+then paste the whole of `~/.config/manicode/credentials.json`) or
+`CODEBUFF_API_KEY`. The key is passed to the run step as
+`AUTOFIX_CODEBUFF_API_KEY`. `lib/ai-provider.sh` takes it out of the
+environment, so gradle, `BUILD_CMD` (the app's own code) and Claude never see
+it, and the driver hands it to Freebuff alone.
+
+**Take over — use a separate Freebuff account for CI.** Freebuff allows one
+session per account across CLI and Desktop. When that session is in use, CI
+presses "Take over" (`FREEBUFF_TAKEOVER`, default `yes` in CI and `no`
+elsewhere; set the repository *variable* `FREEBUFF_TAKEOVER=no` to fail with
+"no AI" instead). That **ends your interactive session** if you use the same
+account, and a local script that also takes over will keep stealing the session
+back. Give CI its own account.
+
+**Credential refresh.** Freebuff may rotate the tokens in `credentials.json`.
+CI cannot write the secret back. When a run sees the file change, it logs
+`AI-PROVIDER: Freebuff refreshed its credentials; update the
+FREEBUFF_CREDENTIALS secret if runs start failing to log in` (never the
+content). If runs then start reporting "not logged in", paste a fresh
+`credentials.json` into the secret.
+
+**Isolation.** In CI (`GITHUB_ACTIONS=true`), Freebuff runs as a dedicated
+unprivileged user, `autofix-fb`, created once with `useradd`. If the runner has
+no passwordless sudo or no `setfacl`, the run stops with "isolation unavailable"
+(no AI for that task) rather than falling back to the runner user; set
+`FREEBUFF_ISOLATION=same` to accept the unisolated mode explicitly.
+- **Home and environment:** a throwaway HOME and a clean `env -i`
+  environment, plus `JAVA_HOME`, `ANDROID_HOME` and `ANDROID_SDK_ROOT`, and a
+  `~/.gradle/gradle.properties` holding only the runner's
+  `org.gradle.java.home` and `org.gradle.jvmargs`. Its own copy of the
+  Freebuff config (credentials `600`, owned by it) and its own tmux server.
+  The runner's Gradle cache sits behind the HOME deny below, so its builds
+  download dependencies afresh (slower, by design).
+- **Project:** bind-mounted into that HOME, and chowned to `autofix-fb` for the
+  run and back afterwards (then `chmod -R u+rwX`). The teardown also runs on
+  TERM/INT/HUP, cannot be cut short by a second signal, and never deletes the
+  throwaway HOME while the project is still mounted in it.
+- **Signing secrets out of the tree:** `ci/clone-app.sh` lists every secret
+  file it places in the clone (`keystore.properties`, `local.properties` with
+  the release passwords for cash/mychef, the `*-release.jks`) in
+  `$RUNNER_TEMP/autofix-secret-files`. For the session the driver moves each
+  one out: `local.properties` keeps only its non-secret lines (`sdk.dir`),
+  other `.properties` files keep their keys with placeholder values (so Gradle
+  still configures), keystores are absent. All are restored afterwards. This
+  happens in same-user mode too.
+- **Nothing left behind for the runner to execute:** after the session,
+  `.git/config`, `.git/hooks` and `.git/info/attributes` are restored from a
+  snapshot (an added `core.fsmonitor`, hook or filter is gone), and a
+  substituted `.git` disables the repository (exit 4). The worker also runs
+  every later git command with `core.fsmonitor=false` and
+  `core.hooksPath=/dev/null`. The result file is read as `autofix-fb`, at most
+  64 KB and never through a symlink, and symlinks/FIFOs planted in
+  `.autofix-logs` are removed before the worker writes there.
+- **No access to the runner's files:** the runner's HOME, `~/.ssh` and
+  `$RUNNER_TEMP` get an explicit no-access ACL for `autofix-fb`. So it cannot
+  read the SSH key, the signing keystore, the runner's
+  `GITHUB_ENV`/`GITHUB_PATH`/`GITHUB_OUTPUT` files or anything else of the
+  runner user's.
+
+**What the isolation is not.** It keeps the runner's secrets from being *read*
+during the Freebuff session. It is **not a sandbox for the code the agent
+writes**: the verification build that follows (`./gradlew`, `BUILD_CMD`) runs
+that code as the runner user, with the signing material back in place, exactly
+as it does Claude's code. Review what Freebuff fixes as you would any
+contribution.
+
+Locally (VM/Mac, no passwordless sudo), Freebuff runs as you with a scrubbed
+environment and a one-line warning: it can read your files. This user-mode path
+is tested offline through a fake `sudo` (`tests/test-ai-fallback.sh`), but the
+real access denials only happen on a CI runner.
+
+**Privacy — read this before setting the secret.** Freebuff is ad-supported.
+Its default model is **Beam 1.0**, and its start screen says **"May use data
+for AI training"**. Assume prompts, and the code it reads, may be retained and
+used for training. With the fallback on, *private app source code and issue
+text are sent to it*, but only while Claude is out of quota. It runs with a
+scrubbed environment: no GitHub, Bitbucket, Anthropic, signing or mail
+credentials, no SSH agent, and no Actions runner command files. In CI it also
+runs as the isolated user above. Repo `.agents`/`mcp.json` files are not
+trusted. For gated apps (`APPROVED_BY`) it also gets the same no-GitHub
+environment as the Claude session.
+
+**Turning it off:** don't set either secret (the workflow then sets
+`AUTOFIX_FALLBACK=none`, and `scan` skips fix jobs while Claude is blocked), or
+set `AUTOFIX_FALLBACK=none` on any host. A Claude limit then pauses fixing
+until the reset, with no harm to the issues.
 
 ---
 

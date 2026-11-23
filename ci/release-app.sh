@@ -49,12 +49,33 @@ fi
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${HOME}/.local/bin:$PATH"
 unset CLAUDECODE  # prevent "nested session" when invoked from cron or a runner
 
+# Claude out of quota: there is nothing to do until it is back, and failing here
+# every hour would bury real failures. /release stays Claude-only (it signs and
+# publishes); the Freebuff fallback is for fixes. lib/ai-provider.sh keeps the
+# reset time, restored across runs by the workflow's cache.
+AGENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../lib/ai-provider.sh
+source "$AGENT_DIR/lib/ai-provider.sh"
+if ! claude_available; then
+    ai_log "release deferred until Claude is back (blocked until $AI_BLOCKED_UNTIL)"
+    exit 0
+fi
+
 before_tag=$(gh release view --repo "$BUGS_REPO" --json tagName -q .tagName 2>/dev/null || echo "")
 log "current release: ${before_tag:-none} — invoking /release"
 
 cd "$PROJECT_DIR" || die "cannot enter $PROJECT_DIR"
 rel_exit=0
-claude --dangerously-skip-permissions -p "/release" </dev/null 2>&1 || rel_exit=$?
+rel_out=$(mktemp)
+"$AUTOFIX_CLAUDE_BIN" --dangerously-skip-permissions -p "/release" </dev/null > "$rel_out" 2>&1 || rel_exit=$?
+cat "$rel_out"
+if [[ $rel_exit -ne 0 ]] && reason=$(claude_limit_reason "$(tail -c 3000 "$rel_out")"); then
+    rm -f "$rel_out"
+    record_claude_limit "$reason"
+    ai_log "Claude limit hit ($reason); Claude blocked until $AI_BLOCKED_UNTIL; release deferred"
+    exit 0
+fi
+rm -f "$rel_out"
 if [[ $rel_exit -ne 0 ]]; then
     die "/release exited $rel_exit — nothing was published"
 fi
